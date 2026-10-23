@@ -62,7 +62,7 @@ export interface RunResult {
 
 export interface Score { base: number; bonus: number; total: number; perWorkload: Record<string, number>; }
 
-export const REF_INTENSITY = 250; // gCO2/kWh reference grid for score normalisation
+export const REF_INTENSITY = 200; // gCO2e/kWh reference, from the run's frozen /api/rules (greenops-score-v2)
 export const BASE_POINTS = 20000;
 export const BONUS_POINTS = 5000;
 

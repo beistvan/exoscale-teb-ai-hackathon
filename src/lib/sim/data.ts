@@ -74,28 +74,29 @@ export interface Workload {
   maxWorkers: number;
   parallelEff: number; // per extra worker efficiency factor
   checkpointH: number | null; // null = restart loses everything
-  refEnergyKWh: number; // fixed reference energy (score weight)
+  refEnergyKWh: number; // fixed reference energy (score weight) — real values from the run's /api/rules
+  realId?: string; // workload ID on the live runner (w-01-…), for user-data binding and status mapping
   note?: string;
 }
 
 const ALL: Country[] = ["CH", ...EU_COUNTRIES];
 
 export const WORKLOADS: Workload[] = [
-  { id: "wl-01", name: "Climate model ensemble", kind: "cpu", release: 0, deadline: 96, work: 160, setupH: 1, outputH: 1, countries: DACH, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.9, checkpointH: null, refEnergyKWh: 14, note: "Restart-sensitive scientific model, DACH only" },
-  { id: "wl-02", name: "Swiss regulatory report", kind: "cpu", release: 12, deadline: 48, work: 24, setupH: 0.5, outputH: 0.5, countries: ["CH"], minGpuMemGB: 0, maxWorkers: 2, parallelEff: 0.85, checkpointH: 2, refEnergyKWh: 3 },
-  { id: "wl-03", name: "Large-input analytics", kind: "cpu", release: 0, deadline: 72, work: 120, setupH: 2, outputH: 1, countries: EU_COUNTRIES, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.8, checkpointH: 4, refEnergyKWh: 11, note: "Two-hour data staging setup" },
-  { id: "wl-04", name: "LLM fine-tune (EU, 48 GB)", kind: "gpu", release: 6, deadline: 84, work: 280, setupH: 1, outputH: 0.5, countries: ["DE", "AT", "FR"], minGpuMemGB: 48, maxWorkers: 4, parallelEff: 0.85, checkpointH: 1, refEnergyKWh: 22 },
-  { id: "wl-05", name: "Image embedding batch", kind: "gpu", release: 0, deadline: 40, work: 90, setupH: 0.5, outputH: 0.5, countries: ALL, minGpuMemGB: 16, maxWorkers: 3, parallelEff: 0.95, checkpointH: 1, refEnergyKWh: 8 },
-  { id: "wl-06", name: "Genome alignment", kind: "cpu", release: 24, deadline: 110, work: 140, setupH: 1, outputH: 1, countries: ALL, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.9, checkpointH: 3, refEnergyKWh: 12 },
-  { id: "wl-07", name: "Grid load forecast retrain", kind: "gpu", release: 30, deadline: 70, work: 120, setupH: 0.5, outputH: 0.5, countries: DACH, minGpuMemGB: 24, maxWorkers: 2, parallelEff: 0.9, checkpointH: 1, refEnergyKWh: 9 },
-  { id: "wl-08", name: "Video transcode archive", kind: "cpu", release: 0, deadline: 120, work: 200, setupH: 0.5, outputH: 1, countries: ALL, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.97, checkpointH: 1, refEnergyKWh: 16 },
-  { id: "wl-09", name: "Fraud model scoring (EU)", kind: "cpu", release: 36, deadline: 60, work: 40, setupH: 0.5, outputH: 0.5, countries: EU_COUNTRIES, minGpuMemGB: 0, maxWorkers: 3, parallelEff: 0.9, checkpointH: 1, refEnergyKWh: 4 },
-  { id: "wl-10", name: "Diffusion training (96 GB)", kind: "gpu", release: 12, deadline: 108, work: 420, setupH: 1.5, outputH: 1, countries: ["DE", "AT", "CH", "PL"], minGpuMemGB: 96, maxWorkers: 4, parallelEff: 0.85, checkpointH: 2, refEnergyKWh: 30 },
-  { id: "wl-11", name: "Search index rebuild", kind: "cpu", release: 48, deadline: 96, work: 64, setupH: 1, outputH: 0.5, countries: ALL, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.85, checkpointH: 2, refEnergyKWh: 6 },
-  { id: "wl-12", name: "Speech-to-text backlog", kind: "gpu", release: 20, deadline: 100, work: 150, setupH: 0.5, outputH: 0.5, countries: ALL, minGpuMemGB: 24, maxWorkers: 3, parallelEff: 0.95, checkpointH: 1, refEnergyKWh: 12 },
-  { id: "wl-13", name: "Monte Carlo risk (CH)", kind: "cpu", release: 60, deadline: 110, work: 80, setupH: 0.5, outputH: 0.5, countries: ["CH"], minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.95, checkpointH: 1, refEnergyKWh: 7 },
-  { id: "wl-14", name: "CFD turbine sweep", kind: "cpu", release: 8, deadline: 90, work: 180, setupH: 1, outputH: 1, countries: ["DE", "AT", "SE", "FR"], minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.85, checkpointH: null, refEnergyKWh: 15, note: "No checkpoints: any move restarts from zero" },
-  { id: "wl-15", name: "Vision QA eval suite", kind: "gpu", release: 72, deadline: 118, work: 60, setupH: 0.5, outputH: 0.5, countries: EU_COUNTRIES, minGpuMemGB: 24, maxWorkers: 2, parallelEff: 0.9, checkpointH: 1, refEnergyKWh: 5 },
+  { id: "wl-01", name: "Climate model ensemble", realId: "w-01-dach-research", kind: "cpu", release: 0, deadline: 96, work: 160, setupH: 1, outputH: 1, countries: DACH, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.9, checkpointH: null, refEnergyKWh: 26.4, note: "Restart-sensitive scientific model, DACH only" },
+  { id: "wl-02", name: "Swiss regulatory report", realId: "w-02-ch-reporting", kind: "cpu", release: 12, deadline: 48, work: 24, setupH: 0.5, outputH: 0.5, countries: ["CH"], minGpuMemGB: 0, maxWorkers: 2, parallelEff: 0.85, checkpointH: 2, refEnergyKWh: 25.344 },
+  { id: "wl-03", name: "Large-input analytics", realId: "w-03-med-analysis", kind: "cpu", release: 0, deadline: 72, work: 120, setupH: 2, outputH: 1, countries: EU_COUNTRIES, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.8, checkpointH: 4, refEnergyKWh: 27.456, note: "Two-hour data staging setup" },
+  { id: "wl-04", name: "LLM fine-tune (EU, 48 GB)", realId: "w-04-dach-batch", kind: "gpu", release: 6, deadline: 84, work: 280, setupH: 1, outputH: 0.5, countries: ["DE", "AT", "FR"], minGpuMemGB: 48, maxWorkers: 4, parallelEff: 0.85, checkpointH: 1, refEnergyKWh: 26.928 },
+  { id: "wl-05", name: "Image embedding batch", realId: "w-05-eu-render", kind: "gpu", release: 0, deadline: 40, work: 90, setupH: 0.5, outputH: 0.5, countries: ALL, minGpuMemGB: 16, maxWorkers: 3, parallelEff: 0.95, checkpointH: 1, refEnergyKWh: 23.232 },
+  { id: "wl-06", name: "Genome alignment", realId: "w-06-large-etl", kind: "cpu", release: 24, deadline: 110, work: 140, setupH: 1, outputH: 1, countries: ALL, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.9, checkpointH: 3, refEnergyKWh: 24.816 },
+  { id: "wl-07", name: "Grid load forecast retrain", realId: "w-07-eu-training", kind: "gpu", release: 30, deadline: 70, work: 120, setupH: 0.5, outputH: 0.5, countries: DACH, minGpuMemGB: 24, maxWorkers: 2, parallelEff: 0.9, checkpointH: 1, refEnergyKWh: 21.12 },
+  { id: "wl-08", name: "Video transcode archive", realId: "w-08-ch-imaging", kind: "cpu", release: 0, deadline: 120, work: 200, setupH: 0.5, outputH: 1, countries: ALL, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.97, checkpointH: 1, refEnergyKWh: 9.24 },
+  { id: "wl-09", name: "Fraud model scoring (EU)", realId: "w-09-eu-large-model", kind: "cpu", release: 36, deadline: 60, work: 40, setupH: 0.5, outputH: 0.5, countries: EU_COUNTRIES, minGpuMemGB: 0, maxWorkers: 3, parallelEff: 0.9, checkpointH: 1, refEnergyKWh: 28.38 },
+  { id: "wl-10", name: "Diffusion training (96 GB)", realId: "w-10-eu-visual", kind: "gpu", release: 12, deadline: 108, work: 420, setupH: 1.5, outputH: 1, countries: ["DE", "AT", "CH", "PL"], minGpuMemGB: 96, maxWorkers: 4, parallelEff: 0.85, checkpointH: 2, refEnergyKWh: 10.488 },
+  { id: "wl-11", name: "Search index rebuild", realId: "w-11-dach-simulation", kind: "cpu", release: 48, deadline: 96, work: 64, setupH: 1, outputH: 0.5, countries: ALL, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.85, checkpointH: 2, refEnergyKWh: 24.816 },
+  { id: "wl-12", name: "Speech-to-text backlog", realId: "w-12-late-delivery", kind: "gpu", release: 20, deadline: 100, work: 150, setupH: 0.5, outputH: 0.5, countries: ALL, minGpuMemGB: 24, maxWorkers: 3, parallelEff: 0.95, checkpointH: 1, refEnergyKWh: 20.064 },
+  { id: "wl-13", name: "Monte Carlo risk (CH)", realId: "w-13-regional-index", kind: "cpu", release: 60, deadline: 110, work: 80, setupH: 0.5, outputH: 0.5, countries: ["CH"], minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.95, checkpointH: 1, refEnergyKWh: 24.288 },
+  { id: "wl-14", name: "CFD turbine sweep", realId: "w-14-bulk-render", kind: "cpu", release: 8, deadline: 90, work: 180, setupH: 1, outputH: 1, countries: ["DE", "AT", "SE", "FR"], minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.85, checkpointH: null, refEnergyKWh: 24.816, note: "No checkpoints: any move restarts from zero" },
+  { id: "wl-15", name: "Vision QA eval suite", realId: "w-15-heavy-archive", kind: "gpu", release: 72, deadline: 118, work: 60, setupH: 0.5, outputH: 0.5, countries: EU_COUNTRIES, minGpuMemGB: 24, maxWorkers: 2, parallelEff: 0.9, checkpointH: 1, refEnergyKWh: 24.288 },
 ];
 
 export const HORIZON_H = 120;

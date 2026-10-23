@@ -38,3 +38,23 @@ export const exoGet = createServerFn({ method: "POST" })
     try { body = JSON.parse(text); } catch { /* keep text */ }
     return { status: res.status, ok: res.ok, body: body as never };
   });
+
+const gridInput = z.object({
+  endpoint: z.string().url().max(300), // e.g. https://<host>/runs/<id>/grid/v4
+  secret: z.string().min(1).max(300),
+  path: z.string().regex(/^\/[A-Za-z0-9/_\-.]*$/).max(200), // e.g. /carbon-intensity/latest
+  query: z.record(z.string(), z.string()).default({}),
+});
+
+/** Read-only GET against the run's Electricity-Maps-compatible grid API (auth-token header). */
+export const gridGet = createServerFn({ method: "POST" })
+  .inputValidator((d: unknown) => gridInput.parse(d))
+  .handler(async ({ data }) => {
+    const url = new URL(data.endpoint.replace(/\/$/, "") + data.path);
+    for (const [k, v] of Object.entries(data.query)) url.searchParams.set(k, v);
+    const res = await fetch(url, { headers: { Accept: "application/json", "auth-token": data.secret } });
+    const text = await res.text();
+    let body: unknown = text;
+    try { body = JSON.parse(text); } catch { /* keep text */ }
+    return { status: res.status, ok: res.ok, body: body as never };
+  });
