@@ -30,3 +30,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Secrets — challenge/run credentials must never be committed
+.env
+.env.*
+!.env.example
+greenops-exo.json
+*.credentials.json
