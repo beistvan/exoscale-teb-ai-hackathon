@@ -29,6 +29,12 @@ export const DEFAULTS = {
   minValuePerCore: 0,  // g CO2e saved per held core-hour below which a pause isn't worth its quota
   noiseBand: 0.05,     // only wait/pause if it saves at least this fraction vs the hour it moves to
   prestage: false,     // create VMs boot+input ahead of release so staging is done when the job releases
+  horizonPenalty: 0,   // forecast-risk penalty for waiting on far-off cheap hours (see risk())
+  hourlyGate: false,   // decide each job's run/pause once per forecast hour (no mid-hour flapping)
+  cleanNoPauseI: 0,    // gate2: jobs whose zone averages below this (gCO2e/kWh x PUE) don't pause while others queue
+  dynamicBar: false,   // gate2: while jobs queue, a pause must save more than the delay costs them
+  dynX: 1,             // ...scale on that opportunity cost
+  reserveSingle: true, // reserve waiting multi-worker jobs as one worker in the projection (mock: +10..+31 pts, 0 misses)
   preempt: false,      // gate2: free quota by DELETING (not stopping) a quick-restart job for a long dirty stretch
   preemptMaxInputS: 900, preemptMaxCkptS: 1800, // ...only jobs that re-stage in <= 15 min and checkpoint <= 30 min
   preemptMinH: 3,      // ...only when the forecast shows at least this many dirty hours ahead
@@ -39,9 +45,14 @@ export const DEFAULTS = {
   gpuDutyMaxLatH: 0.5, // ...so gpuDutyW only applies while API latency is below this (sim hours)
   lowLatH: 0.15,       // API latency (sim hours) at or below which `lowLat` overrides apply
   lowLat: { cpuWindowH: 1e9, pressureValuePerCore: 0.08 },
+  // optional low-lag deadline margin cut (base 4h -> 1h): mock +27 pts, but live run 7 scored
+  // 5 pts below run 6 (CPU jobs gained, GPU jobs lost), so it is off by default
+  marginCutH: 0, lowLatMarginMinH: 1,
   gpuTightW: 0,        // GPU placements needing more than gpuTightAt of their window are penalised by this per unit
   gpuTightAt: 0.6,
   scarcityW: 0.25,     // ranking penalty per full share of the vCPU / GPU-family quota a placement takes
+  cleanZoneSmallVm: 0, // grams added per vCPU held, for CPU placements in zones cleaner than cleanZoneMaxI
+  cleanZoneMaxI: 90,   // (forecast mean x PUE, gCO2e/kWh) — favours 16-vCPU VMs for jobs on very clean grids
   scarcityMode: "cores", // "cores" (share held at once) | "coreHours" (share x time held) | "gpuCoreHours" (GPU only)
   cardW: 1,            // weight of the GPU-card share in the scarcity penalty
   stickyTol: 0.15,     // keep a waiting job's reserved placement unless another ranks >15% better
@@ -64,13 +75,19 @@ export const DEFAULTS = {
 const H = 3.6e6;
 const marginH = (o, needH) => Math.max(o.marginMinH, o.marginFrac * needH);
 
+// Forecast error grows with lead time, and picking the cheapest-looking hours favours hours whose
+// error happens to be low. HP > 0 makes an hour i ahead look (1 + HP*sqrt(i/24)) dirtier when
+// ranking, so a far-off dip must beat the near term by more before the job waits for it.
+let HP = 0;
+const risk = (fc) => (HP > 0 ? fc.map((v, i) => v * (1 + HP * Math.sqrt(i / 24))) : fc);
+
 /** Proportional rule: within the visible window, run in the cheapest ceil(W*need/avail) hours. */
 export function gate(fc, needH, availH) {
   if (needH <= 0) return true;
   if (!fc?.length || needH >= availH - 0.25) return true;
   const W = Math.max(1, Math.min(fc.length, Math.floor(availH)));
   const n = Math.min(W, Math.ceil((W * needH) / availH + 1e-9));
-  const sorted = fc.slice(0, W).sort((a, b) => a - b);
+  const sorted = risk(fc).slice(0, W).sort((a, b) => a - b);
   return fc[0] <= sorted[n - 1] + 1e-9;
 }
 /** True when waiting would save less than `band` (relative) — i.e. within forecast noise. */
@@ -78,7 +95,7 @@ function withinNoise(fc, needH, availH, band) {
   if (!(band > 0) || !fc?.length || needH >= availH - 0.25) return false;
   const W = Math.max(1, Math.min(fc.length, Math.floor(availH)));
   const n = Math.min(W, Math.ceil((W * needH) / availH + 1e-9));
-  const thr = fc.slice(0, W).sort((a, b) => a - b)[n - 1];
+  const thr = risk(fc).slice(0, W).sort((a, b) => a - b)[n - 1];
   return fc[0] - thr < band * Math.max(1, thr);
 }
 /** gCO2e/kWh saved by moving the current hour of work to the hour the gate would use instead. */
@@ -86,7 +103,7 @@ function hourSaving(fc, needH, availH) {
   if (!fc?.length || needH >= availH - 0.25) return 0;
   const W = Math.max(1, Math.min(fc.length, Math.floor(availH)));
   const n = Math.min(W, Math.ceil((W * needH) / availH + 1e-9));
-  const sorted = fc.slice(0, W).sort((a, b) => a - b);
+  const sorted = risk(fc).slice(0, W).sort((a, b) => a - b);
   return Math.max(0, fc[0] - sorted[n - 1]);
 }
 
@@ -179,6 +196,13 @@ function placements(cat, view, o, j, tPlan) {
     // a GPU job squeezed into most of its window can't dodge dirty days beyond the 24h forecast
     * (1 + (c.prof.family === "cpu" ? 0 : o.gpuTightW) * Math.max(0, Math.min(1, c.needH / Math.max(1e-6, c.hardH)) - o.gpuTightAt));
   scored.sort((a, b) => a.rank - b.rank || a.prof.cores * a.k - b.prof.cores * b.k);
+  // quota opportunity cost is not proportional to a job's own carbon: in a very clean zone (e.g. CH)
+  // a small VM costs a few grams but frees quota that dirtier jobs use to dodge their dirty hours
+  if (o.cleanZoneSmallVm > 0) {
+    const fcMean = (z) => { const f = view.fc(z.area) ?? []; return f.length ? f.reduce((a, b) => a + b, 0) / f.length : Infinity; };
+    for (const c of scored) if (c.prof.family === "cpu" && fcMean(c.zone) * c.zone.pue < o.cleanZoneMaxI) c.rank += o.cleanZoneSmallVm * c.prof.cores * c.k;
+    scored.sort((a, b) => a.rank - b.rank || a.prof.cores * a.k - b.prof.cores * b.k);
+  }
   // sticky: a job already holding a reservation keeps that placement unless another is clearly better
   const memo = view.memo?.get(j.w.id);
   if (memo) {
@@ -210,6 +234,10 @@ export function decide(cat, view, opts = {}) {
   // with a fast API the controller can afford wider CPU windows and more pauses while others queue
   // (mock: +24 pts at 0.3 s lag, but -94 pts and a miss at 3 s lag) — so only below lowLatH
   const o = o0.latH <= o0.lowLatH ? { ...o0, ...o0.lowLat } : o0;
+  // with a fast API the deadline margin can shrink (durations are deterministic; the controller's
+  // latency term is kept): mock +10..+33 pts, 0 misses in 220 runs at a 1 h base
+  if (o0.latH <= o0.lowLatH && o.marginCutH > 0) o.marginMinH = Math.max(o.lowLatMarginMinH, o0.marginMinH - o.marginCutH);
+  HP = Number(o.horizonPenalty) || 0;
   const acts = [];
   const tH = view.t;
   const relH = (j) => (j.w.release - cat.T0) / H;
@@ -273,7 +301,16 @@ export function decide(cat, view, opts = {}) {
     const fc = view.fc(zone.area);
     const sinceH = tH - (j.deployedH ?? tH);
     const availH = prof.family === "cpu" ? Math.min(due - tH, Math.max(runNeed, o.cpuWindowH - sinceH)) : due - tH;
-    const gateRun = !pausable || gate(fc, runNeed, availH) || withinNoise(fc, runNeed, availH, o.noiseBand);
+    let gateRun = !pausable || gate(fc, runNeed, availH) || withinNoise(fc, runNeed, availH, o.noiseBand);
+    // The forecast is hourly but this runs every 250 ms: the need/window ratio drifts within the hour
+    // and flipped jobs off and on minutes apart. Decide once per forecast hour and keep it (a
+    // deadline-forced run always wins).
+    if (o.hourlyGate && pausable && view.memo) {
+      const hr = Math.floor(tH), key = `gate:${j.w.id}`, m = view.memo.get(key);
+      const forced = runNeed >= availH - 0.25;
+      if (m && m.h === hr && !forced) gateRun = m.run;
+      else view.memo.set(key, { h: hr, run: gateRun });
+    }
     const value = pausable && !gateRun ? (prof.watts * k / 1000) * zone.pue * hourSaving(fc, runNeed, availH) : 0;
     const fcMean = fc?.length ? fc.reduce((a, b) => a + b, 0) / fc.length : 0;
     const estG = ((prof.watts * k) / 1000) * (setupH(j.w, prof) + j.w.required / rateK(j.w, prof, k) + outputH(j.w)) * zone.pue * fcMean;
@@ -300,6 +337,14 @@ export function decide(cat, view, opts = {}) {
     cards: Object.fromEntries(Object.keys(cat.quota.cards).map((f) => [f, Math.max(0, (view.usage.cards[f] ?? 0) - (heldOpen.cards[f] ?? 0))])),
   };
 
+  // While a multi-worker job waits, reserve its quota as ONE worker (its most efficient, slowest
+  // shape). Planning it as k workers let it be pushed to the very end and squeezed in, so it
+  // absorbed every other job's delays and ran compressed in dirty hours (w-14: t=20 -> t=85).
+  const single = (list, bestC) => {
+    if (!o.reserveSingle || !bestC || bestC.k <= 1 || bestC.forced) return bestC;
+    const one = list.filter((c) => c.k === 1 && !c.doomed && !c.forced).sort((a, b) => (a.rank ?? a.grams) - (b.rank ?? b.grams))[0];
+    return one ?? bestC;
+  };
   // Released jobs without VMs: admit now, first-fit in deadline order (the same rule the
   // fast-forward uses), each with its cleanest placement that fits within fitTol.
   const free = { vms: view.usage.vms, cores: view.usage.cores, cards: { ...view.usage.cards } };
@@ -321,7 +366,7 @@ export function decide(cat, view, opts = {}) {
       if (!fitsQuota(cat, free, c.prof, c.k)) continue;
       if ((c.rank ?? c.grams) <= (best.rank ?? best.grams) * (1 + o.fitTol) || best.forced || c.forced) { pick = c; break; }
     }
-    const use = pick ?? best;
+    const use = pick ?? single(x.list, best);
     const f = footprint(use.prof, use.k);
     const due = deadlineH(x.j) - marginH(o, use.needH);
     // every fresh job is a waiting item at `now`; the backfill decides whether it may start now.
@@ -341,7 +386,8 @@ export function decide(cat, view, opts = {}) {
   // Future releases take part in the fast-forward with their best placement at release time.
   for (const j of open) {
     if (j.vms.length || releasedOrSoon(j)) continue;
-    const best = placements(cat, view, o, j, relH(j))[0];
+    const list = placements(cat, view, o, j, relH(j));
+    const best = single(list, list[0]);
     if (!best) continue;
     items.push({ id: j.w.id, fp: footprint(best.prof, best.k), needH: best.needH, due: deadlineH(j) - marginH(o, best.needH), deployed: false, avail: relH(j) });
   }
@@ -377,7 +423,6 @@ export function decide(cat, view, opts = {}) {
     // worth the quota it keeps idle (higher bar while another job waits for quota). With a safe
     // projection they're all granted; otherwise only those that leave nobody worse off.
     const blocked = fresh.some((x) => !((plan.start.get(x.j.w.id) ?? Infinity) <= tH + 1e-6));
-    const bar = (fp) => (blocked ? o.pressureValuePerCore : o.minValuePerCore) * fp.cores;
     // points per gram differ by job (score formula): a CPU job's gram is worth ~1.7x a big GPU job's
     let wt = () => 1;
     if (o.pointsAware) {
@@ -388,8 +433,28 @@ export function decide(cat, view, opts = {}) {
       const mean = Object.values(m).reduce((a, b) => a + b, 0) / Math.max(1, Object.keys(m).length);
       wt = (id) => (m[id] ?? mean) / mean;
     }
+    // What a pause really costs while jobs queue for quota: each queued job starts later, with less
+    // window to dodge dirty hours. Estimate that per hour of delay (its expected grams if it starts
+    // `q` hours later, from the forecast shifted by q), points-weighted; a pause must save more.
+    let oppCost = 0;
+    if (blocked && o.dynamicBar) {
+      const qh = Math.max(1, Math.round(q));
+      for (const x of fresh) {
+        if ((plan.start.get(x.j.w.id) ?? Infinity) <= tH + 1e-6 || !x.use || x.use.forced) continue;
+        const rem = Math.max(0, x.j.w.required - x.j.done), cal = view.calib?.[x.j.w.unit] ?? 1;
+        const c = { zone: x.use.zone, prof: x.use.prof, k: x.use.k };
+        const now = scorePlacement(cat, x.j.w, c, rem, tH, view.fc, o, cal);
+        if (!now) continue;
+        const later = scorePlacement(cat, x.j.w, c, rem, tH + qh, (a) => view.fc(a)?.slice(qh), o, cal);
+        const perH = later ? Math.max(0, later.grams - now.grams) / qh : now.grams * 0.05; // can't start later → costly
+        oppCost = Math.max(oppCost, perH * wt(x.j.w.id));
+      }
+    }
+    const bar = (fp) => (blocked ? (o.dynamicBar ? o.dynX * oppCost : o.pressureValuePerCore * fp.cores) : o.minValuePerCore * fp.cores);
+    // jobs on very clean grids save little by pausing, so while anyone queues they keep running
+    const cleanJob = (d) => { const z = cat.zones.get(d.j.vms[0]?.zone); const f = z && view.fc(z.area); return !!f?.length && (f.reduce((a, b) => a + b, 0) / f.length) * z.pue < o.cleanNoPauseI; };
     const cands = [
-      ...deployed.filter((d) => d.pausable && !d.gateRun && d.value > 0 && d.value * wt(d.j.w.id) >= bar(d.it.fp)).map((d) => ({ kind: "pause", it: d.it, value: d.value * wt(d.j.w.id) })),
+      ...deployed.filter((d) => d.pausable && !d.gateRun && d.value > 0 && d.value * wt(d.j.w.id) >= bar(d.it.fp) && !(blocked && o.cleanNoPauseI > 0 && cleanJob(d))).map((d) => ({ kind: "pause", it: d.it, value: d.value * wt(d.j.w.id) })),
       ...fresh.filter((x) => x.pick && !x.gateNow && x.value > 0 && x.value * wt(x.j.w.id) >= bar(x.it.fp)).map((x) => ({ kind: "defer", it: x.it, value: x.value * wt(x.j.w.id) })),
     ].sort((a, b) => b.value - a.value);
     if (o.preempt && blocked) {

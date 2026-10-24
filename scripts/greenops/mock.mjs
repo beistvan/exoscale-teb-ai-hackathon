@@ -252,7 +252,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const LAT = li >= 0 ? Number(args[li + 1]) : 3000;
   const P = {}, C = {};
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--opt" || args[i] === "--ctl") { const [k, v] = args[i + 1].split("="); (args[i] === "--opt" ? P : C)[k] = v === "true" ? true : v === "false" ? false : isNaN(Number(v)) ? v : Number(v); i++; }
+    if (args[i] === "--opt" || args[i] === "--ctl") { const [k, v] = args[i + 1].split("="); (args[i] === "--opt" ? P : C)[k] = v === "true" ? true : v === "false" ? false : v.startsWith("{") ? JSON.parse(args[i + 1].slice(k.length + 1)) : isNaN(Number(v)) ? v : Number(v); i++; }
   }
   let tot = 0, fails = 0, totB = 0, totP = 0;
   for (let s = 1; s <= SEEDS; s++) {

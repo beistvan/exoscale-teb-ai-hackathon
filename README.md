@@ -234,7 +234,7 @@ How it decides, in plain terms:
 
 1. **Where** — each job goes to the legal zone and machine with the lowest expected carbon: energy × the datacenter's PUE × the cheapest forecast hours it will need. Residency is re-checked right before every create.
 2. **When** — a job runs in the cleanest hours of the published 24 h forecast, as many as it still needs before its deadline, and is stopped (0 W) in the dirtier ones. Pauses are ranked by **points** saved, using the score formula.
-3. **Safety** — before any pause or delayed start it fast-forwards the rest of the schedule (all jobs flat-out afterwards; jobs claim the 320-vCPU quota in deadline order, including jobs not released yet). A pause is kept only if every job still finishes before its deadline minus a margin.
+3. **Safety** — before any pause or delayed start it fast-forwards the rest of the schedule (all jobs flat-out afterwards; jobs claim the 320-vCPU quota in deadline order, including jobs not released yet). A pause is kept only if every job still finishes before its deadline minus a margin. While a job that may use several workers waits, its quota is reserved as a single worker, so it can't be pushed to the end and squeezed in.
 4. **Slow API** — status polls, forecasts and VM actions run in the background, so a slow call never stalls the loop. It extrapolates the simulated clock, plans for when an action will actually land, and widens margins as lag grows. Settings that only pay off with a fast API switch on only below ≈ 0.15 simulated hours of lag.
 5. **Housekeeping** — deterministic VM names + a receipt; it adopts VMs it didn't create, deletes VMs as soon as their job delivers, and deletes VMs of a job whose deadline has passed.
 
@@ -245,6 +245,8 @@ Practice runs with this controller (360×, 15/15 delivered, 0 API errors each):
 | `427b8228` | 21 820.5 | 14.29 kg | first clean run of this controller (run pre-started by the demo) |
 | `f625ae89` | 21 913.6 | 13.83 kg | pauses ranked by points (exact score formula) |
 | `2dd99b04` | 21 972.5 | 13.57 kg | wider CPU windows and a lower pause bar while API lag is low |
+| `c2111a37` | **22 028.3** | 13.30 kg | waiting multi-worker jobs reserve quota as one worker (w-14 starts at t≈27, not t≈85) |
+| `abbd0823` | 22 023.3 | 13.35 kg | 720×; experimental 1 h deadline margin at low lag — CPU jobs gained, GPU jobs lost, so it is off by default |
 
 ## What was fixed / changed (this repo)
 
