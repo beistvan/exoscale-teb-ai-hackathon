@@ -10,7 +10,10 @@
  *  (mock-sync.mjs is the older, faster policy-only mock without latency.)
  *
  *  Usage: node scripts/greenops/mock.mjs [seeds=20] [--lat MEDIAN_MS] [--verbose] [--opt k=v ...] [--ctl k=v ...]
- *  Env stress knobs: MOCK_SLOW (engine speed factor vs catalog), MOCK_RESUME_BOOT_S (boot on resume)
+ *  Env stress knobs: MOCK_SLOW (engine speed factor vs catalog), MOCK_RESUME_BOOT_S (boot on resume),
+ *  MOCK_STAGING=idle (staging at idle watts), MOCK_PRESTAGE=0 (no staging before release), MOCK_QUOTA=big
+ *  (no quota, diagnostic), MOCK_FC_BIAS=b (forecasts off by +/-b x lead/24), MOCK_FC_ANOM=sigma,rho
+ *  (persistent misses the forecast doesn't know), MOCK_HIST_LAG=h (observation publication lag, default 2)
  */
 import { loadCatalog, zoneLegal, profileLegal, fitsQuota, rateK, setupH, outputH, candidates, score } from "./model.mjs";
 import { Controller } from "./controller.mjs";
@@ -22,6 +25,7 @@ const STAGING_IDLE = process.env.MOCK_STAGING === "idle"; // power model variant
 // The real engine boots and stages input before a job's release (observed live: a VM created at
 // t=0 for a t=4 job was computing at t=4.0); compute waits for release. MOCK_PRESTAGE=0 disables.
 const PRESTAGE = process.env.MOCK_PRESTAGE !== "0";
+const HIST_LAG = Number(process.env.MOCK_HIST_LAG ?? 2);
 
 function rng(seed) { let s = (seed >>> 0) || 1; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 2 ** 32; }; }
 function gauss(r) { return Math.sqrt(-2 * Math.log(r() + 1e-12)) * Math.cos(2 * Math.PI * r()); }
@@ -42,12 +46,24 @@ function makeGrid(seed, hours = 160) {
     }
     actual[a] = arr;
   }
+  // MOCK_FC_ANOM="sigma,rho": the actuals carry a persistent hour-to-hour deviation (AR(1) over target
+  // hours) that the forecast doesn't know — a stand-in for a smooth forecast missing local swings
+  const [AS, AR] = String(process.env.MOCK_FC_ANOM ?? "0,0").split(",").map(Number);
+  const base = {};
+  for (const a of Object.keys(ARCH)) {
+    base[a] = actual[a].slice();
+    if (AS > 0) { let x = 0; actual[a] = actual[a].map((v) => { x = AR * x + Math.sqrt(1 - AR * AR) * AS * gauss(r); return Math.max(5, v * (1 + x)); }); }
+  }
   const fcErr = {};
   for (const a of Object.keys(ARCH)) {
     fcErr[a] = [];
     for (let h = 0; h < hours; h++) { const row = []; let e = 0; for (let i = 0; i < 24; i++) { e = 0.8 * e + 0.035 * gauss(r); row.push(e * (1 + i / 12)); } fcErr[a].push(row); }
   }
-  const fc = (a, tH) => { const h0 = Math.floor(tH); return Array.from({ length: 24 }, (_, i) => actual[a][Math.min(hours - 1, h0 + i)] * (1 + fcErr[a][Math.min(hours - 1, h0)][i])); };
+  // MOCK_FC_BIAS=b: each area's forecast is biased by +/-b x (lead/24) (sign random per area) — a
+  // stand-in for real forecasts that are systematically off, to test bias learning
+  const B = Number(process.env.MOCK_FC_BIAS ?? 0);
+  const sign = Object.fromEntries(Object.keys(ARCH).map((a) => [a, r() < 0.5 ? -1 : 1]));
+  const fc = (a, tH) => { const h0 = Math.floor(tH); return Array.from({ length: 24 }, (_, i) => base[a][Math.min(hours - 1, h0 + i)] * (1 + fcErr[a][Math.min(hours - 1, h0)][i]) * (1 + sign[a] * B * (i / 24))); };
   return { actual, fc };
 }
 
@@ -156,6 +172,9 @@ class Engine {
     return { ok: true, status: 200 };
   }
   forecast(area) { const h0 = Math.floor(this.t); return this.grid.fc(area, this.t).map((v, i) => ({ t: this.cat.T0 + (h0 + i) * H, v })); }
+  // published observations: hours ending at least 1 h ago, most recent 24
+  // (MOCK_HIST_LAG=L: hours up to floor(t) - L are published; default 2 = the guide's 1 h after the hour ends)
+  history(area) { const h1 = Math.floor(this.t) + 1 - HIST_LAG; const out = []; for (let h = Math.max(0, h1 - 24); h < h1; h++) out.push({ t: this.cat.T0 + h * H, v: this.grid.actual[area][h] }); return out; }
 }
 
 function makeMockApi(engine, clock, latMs, r) {
@@ -172,6 +191,7 @@ function makeMockApi(engine, clock, latMs, r) {
     templates: new Map(),
     status: () => call(() => engine.status()),
     forecast: (a) => call(() => engine.forecast(a)),
+    history: (a) => call(() => engine.history(a)),
     create: (zone, profId, name, wl) => call(() => engine.create(zone, profId, name, wl, clock.now())),
     listInstances: (zone) => call(() => [...engine.vms.values()].filter((v) => v.zone === zone).map((v) => ({ id: v.id, name: v.name }))),
     findByName: (zone, name) => call(() => [...engine.vms.values()].find((v) => v.name === name)?.id ?? null),

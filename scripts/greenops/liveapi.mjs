@@ -78,6 +78,14 @@ export function makeLiveApi({ key, secret, cloudEndpoint, workEndpoint, gridEndp
       if (!r?.ok || !r.json) return null;
       return (r.json.forecast ?? []).map((p) => ({ t: Date.parse(p.datetime), v: Number(p.carbonIntensity) })).filter((p) => isFinite(p.t) && isFinite(p.v));
     },
+    /** This run's published observations (most recent 24 h), for learning the forecast's errors. */
+    async history(area) {
+      const u = new URL(`${GRID}/carbon-intensity/history`);
+      u.searchParams.set("zone", area);
+      const r = await req(u, { headers: { Accept: "application/json", "auth-token": gridSecret } }).catch(() => null);
+      if (!r?.ok || !r.json) return null;
+      return (r.json.history ?? []).map((p) => ({ t: Date.parse(p.datetime), v: Number(p.carbonIntensity) })).filter((p) => isFinite(p.t) && isFinite(p.v));
+    },
     templates: new Map(),
     async create(zone, profId, name, wl) {
       const tid = this.templates.get(zone);

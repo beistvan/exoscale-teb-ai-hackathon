@@ -20,4 +20,5 @@
 - This is the only code that writes to a run (creates, stops, deletes VMs). `orchestrator-legacy.mjs` is the superseded v1, kept for reference — don't extend it.
 - A run is single-shot: the clock starts on the first create. Before any live attempt, run `make mock` (offline, synthetic grid, simulated API latency) and `make attempt-dry` (plan-only against the real run); only then `make attempt`.
 - The API can take 3–20 s per call, so controller logic must stay async and tolerate slow/lost responses (receipts + deterministic VM names). Test changes with `mock.mjs --lat`.
+- Fair play: decisions may use only this run's own published data (status, forecasts, grid observations), at decision time. Never store, archive or reuse grid series across runs, and never tune the policy or mock to them — every run shares one scenario grid, so that would be a view of the future. The mock grid stays synthetic.
 - Secrets and run artifacts (`.env`, `greenops-exo.json`, `greenops-orchestrator-state.json`, `orchestrator-events.jsonl`, `runs-archive/`) are gitignored and dockerignored; keep it that way.

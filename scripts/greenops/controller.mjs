@@ -27,6 +27,14 @@ export const CONTROL = {
   latencyMarginX: 2.5,   // + this many "action latencies" (in sim hours) of extra margin
   minDwellH: 0.6,        // don't toggle the same VM again sooner than this (sim hours)
   maxLatH: 4,            // cap on the latency used for planning
+  learnBias: true,       // learn each area's forecast error by lead time from this run's own published
+                         // observations, and correct forecasts before the policy sees them
+  biasShrinkN: 24,       // ...shrink a lead's mean error toward 0 with this many pseudo-samples
+  biasCap: 0.3,          // ...never correct by more than +/-30 %
+  nowcast: true,         // (with learnBias) carry the latest observed forecast miss forward, decaying by
+                         // the hour-to-hour persistence this run's own misses show (off if they don't persist)
+  nowcastMinN: 12,       // ...needs this many consecutive-hour pairs of observed lead-0 misses
+  nowcastMinRho: 0.3,    // ...and at least this lag-1 autocorrelation
 };
 
 export class Controller {
@@ -41,6 +49,7 @@ export class Controller {
     this.deleted = new Set(this.st.deleted);
     this.snap = null; this.statusInflight = 0; this.lastStatusStart = -1e15;
     this.fc = new Map(); this.fcInflight = new Set();
+    this.fcLog = new Map(); this.obs = new Map(); this.histHour = new Map(); this.histInflight = new Set(); this.biasCache = { hour: -1, b: new Map() };
     this.inCreate = new Map(); // wl -> { zone, prof, k, left }
     this.inVm = new Map();     // vmId -> verb in flight
     this.override = new Map(); // vmId -> { state, wallAck, tAck }
@@ -75,9 +84,74 @@ export class Controller {
     for (const a of new Set([...this.cat.zones.values()].map((z) => z.area))) {
       if (this.fc.get(a)?.hour === hour || this.fcInflight.has(a)) continue;
       this.fcInflight.add(a);
-      this.api.forecast(a).then((pts) => { if (pts?.length) this.fc.set(a, { hour, pts }); })
-        .catch(() => {}).finally(() => this.fcInflight.delete(a));
+      this.api.forecast(a).then((pts) => {
+        if (!pts?.length) return;
+        // vh: the hour the returned vintage starts at (can be hour-1 when asked just past a boundary)
+        const vh = Math.round((pts[0].t - this.cat.T0) / H);
+        this.fc.set(a, { hour, vh, pts });
+        if (this.o.learnBias) { // keep what was forecast at each issue hour, to score it later
+          // (the trace keeps vintage timing only, no grid values: every run shares one scenario grid,
+          // so a kept series would be a view of the next run's future)
+          this.event({ k: "fc", area: a, hour, vh, n: pts.length });
+          const log = this.fcLog.get(a) ?? new Map(); log.set(vh, pts); this.fcLog.set(a, log);
+          for (const h of log.keys()) if (h < hour - 72) log.delete(h);
+          this.biasCache = { hour: -1, b: new Map() }; // new evidence → recompute corrections
+        }
+      }).catch(() => {}).finally(() => this.fcInflight.delete(a));
     }
+  }
+
+  /** Published observations (this run only), fetched once per simulated hour per area. */
+  refreshHistory(hour) {
+    if (!this.o.learnBias || !this.api.history) return;
+    for (const a of new Set([...this.cat.zones.values()].map((z) => z.area))) {
+      if (this.histHour.get(a) === hour || this.histInflight.has(a)) continue;
+      this.histInflight.add(a);
+      this.api.history(a).then((pts) => {
+        if (!pts?.length) return;
+        const m = this.obs.get(a) ?? new Map(); for (const p of pts) m.set(p.t, p.v); this.obs.set(a, m);
+        this.histHour.set(a, hour);
+        this.biasCache = { hour: -1, b: new Map() };
+        // publication lag as seen by this run (hours between now and the newest published hour)
+        const newest = Math.max(...pts.map((p) => p.t));
+        const bb = this.biasFor(a, hour);
+        this.event({ k: "hist", area: a, hour, lagH: +(hour - (newest - this.cat.T0) / H).toFixed(2), n: m.size, b0: +bb[0].toFixed(3), b12: +bb[12].toFixed(3), anom: bb.anom ? { rho: +bb.anom.rho.toFixed(2), a0: +bb.anom.a0.toFixed(3), t0: bb.anom.t0 } : null });
+      }).catch(() => {}).finally(() => this.histInflight.delete(a));
+    }
+  }
+
+  /** Mean relative forecast error per lead hour for an area (forecast / observed - 1), shrunk and capped. */
+  biasFor(area, hour) {
+    if (this.biasCache.hour !== hour) this.biasCache = { hour, b: new Map() };
+    if (this.biasCache.b.has(area)) return this.biasCache.b.get(area);
+    const sum = new Float64Array(25), cnt = new Float64Array(25);
+    const obs = this.obs.get(area), log = this.fcLog.get(area);
+    if (obs && log) for (const [h0, pts] of log) for (const p of pts) {
+      const o = obs.get(p.t); if (!(o > 0)) continue;
+      const lead = Math.round((p.t - (this.cat.T0 + h0 * H)) / H); if (lead < 0 || lead > 24) continue;
+      sum[lead] += p.v / o - 1; cnt[lead]++;
+    }
+    const b = Array.from({ length: 25 }, (_, i) => Math.max(-this.o.biasCap, Math.min(this.o.biasCap, sum[i] / (cnt[i] + this.o.biasShrinkN))));
+    b.anom = this.o.nowcast ? this.anomalyFor(area, b) : null;
+    this.biasCache.b.set(area, b);
+    return b;
+  }
+
+  /** The latest observed lead-0 miss beyond the learned bias, and how strongly misses persist from one
+   *  hour to the next in this run (lag-1 autocorrelation). null while they don't measurably persist. */
+  anomalyFor(area, b) {
+    const log = this.fcLog.get(area), obs = this.obs.get(area);
+    if (!log || !obs) return null;
+    const a = new Map();
+    for (const [h0, pts] of log) {
+      const p = pts[0]; const o = p && p.t === this.cat.T0 + h0 * H ? obs.get(p.t) : undefined;
+      if (o > 0) a.set(h0, p.v / o - 1 - b[0]);
+    }
+    let sxy = 0, sxx = 0, n = 0, last = -Infinity;
+    for (const [h0, x] of a) { if (h0 > last) last = h0; const y = a.get(h0 + 1); if (y !== undefined) { sxy += x * y; sxx += x * x; n++; } }
+    if (n < this.o.nowcastMinN || !(sxx > 0)) return null;
+    const rho = Math.min(0.95, sxy / sxx);
+    return rho >= this.o.nowcastMinRho ? { rho, a0: a.get(last), t0: last, n } : null;
   }
 
   /** Simulated hours "now", extrapolated from the freshest snapshot. */
@@ -113,11 +187,21 @@ export class Controller {
     v.t = tAct;
     v.memo = this.memo;
     const hourStart = this.cat.T0 + Math.floor(tAct) * H;
+    const nowHour = Math.floor(tAct);
     v.fc = (area) => {
       const c = this.fc.get(area);
       if (!c) return null;
-      const arr = c.pts.filter((p) => p.t >= hourStart).map((p) => p.v);
-      return arr.length ? arr : [c.pts[c.pts.length - 1].v];
+      const b = this.o.learnBias ? this.biasFor(area, nowHour) : null;
+      const cap = 2 * this.o.biasCap;
+      const val = (p) => {
+        if (!b) return p.v;
+        const tau = (p.t - this.cat.T0) / H;
+        let e = b[Math.max(0, Math.min(24, Math.round(tau - (c.vh ?? c.hour))))];
+        if (b.anom) e += b.anom.a0 * b.anom.rho ** Math.max(0, tau - b.anom.t0);
+        return p.v / (1 + Math.max(-cap, Math.min(cap, e)));
+      };
+      const arr = c.pts.filter((p) => p.t >= hourStart).map(val);
+      return arr.length ? arr : [val(c.pts[c.pts.length - 1])];
     };
     return v;
   }
@@ -253,6 +337,7 @@ export class Controller {
     const latH = snap.state === "RUNNING" ? this.latH() : 0;
     const tAct = tNow + latH;
     this.refreshForecasts(Math.floor(tAct));
+    this.refreshHistory(Math.floor(tNow));
     const areas = new Set([...this.cat.zones.values()].map((z) => z.area));
     if ([...areas].some((a) => !this.fc.has(a))) return; // wait for the first forecast fill
 

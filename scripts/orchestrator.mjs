@@ -3,7 +3,8 @@
  *
  *  Plans with scripts/greenops/policy.mjs (where + when to run), executes with the latency-tolerant
  *  loop in scripts/greenops/controller.mjs. Knowledge used: the vendored public catalog, this run's
- *  /work/v1/status, and this run's currently published 24h forecasts. Nothing else.
+ *  /work/v1/status, this run's currently published 24h forecasts, and this run's published grid
+ *  observations (to correct those forecasts). Nothing else — no other run's data.
  *
  *  Usage: node scripts/orchestrator.mjs [--dry] [--state FILE]   run until all delivered / run ends
  *         node scripts/orchestrator.mjs destroy [--state FILE]   delete this controller's VMs

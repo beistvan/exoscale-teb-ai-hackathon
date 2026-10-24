@@ -44,10 +44,14 @@ export const DEFAULTS = {
   gpuDutyW: 0,         // same for GPU placements (0.6 helped at low lag but missed deadlines at 10 s lag)
   gpuDutyMaxLatH: 0.5, // ...so gpuDutyW only applies while API latency is below this (sim hours)
   lowLatH: 0.15,       // API latency (sim hours) at or below which `lowLat` overrides apply
-  lowLat: { cpuWindowH: 1e9, pressureValuePerCore: 0.08 },
-  // optional low-lag deadline margin cut (base 4h -> 1h): mock +27 pts, but live run 7 scored
-  // 5 pts below run 6 (CPU jobs gained, GPU jobs lost), so it is off by default
+  // (prestage only at low lag: mock +6..+20 pts at 0.1-0.3 s, but -11 at 3 s and -53 at 10 s lag)
+  lowLat: { cpuWindowH: 1e9, pressureValuePerCore: 0.08, marginCutH: 3, prestage: true },
+  // low-lag deadline margin cut (base 4h -> 1h) for CPU jobs only: live run 7 applied it to all jobs
+  // and scored 5 pts below run 6 — CPU jobs gained, GPU jobs lost — so GPUs keep the full margin
   marginCutH: 0, lowLatMarginMinH: 1,
+  marginCpuOnly: true, // the cut applies to CPU jobs only; GPU jobs keep the full margin
+  pauseOutput: false,  // allow pausing during the final output phase (it otherwise always runs)
+  llf: false,          // reserve queued jobs least-laxity-first (due - need) instead of earliest-due-first
   gpuTightW: 0,        // GPU placements needing more than gpuTightAt of their window are penalised by this per unit
   gpuTightAt: 0.6,
   scarcityW: 0.25,     // ranking penalty per full share of the vCPU / GPU-family quota a placement takes
@@ -73,7 +77,9 @@ export const DEFAULTS = {
 };
 
 const H = 3.6e6;
-const marginH = (o, needH) => Math.max(o.marginMinH, o.marginFrac * needH);
+// GPU jobs can keep the larger margin (marginCpuOnly): live run 7 showed GPUs given the thin margin
+// postponing their last hours into forecast-cheap hours that turned out dirtier
+const marginH = (o, needH, fam = "cpu") => Math.max(fam !== "cpu" && o.marginCpuOnly && o.marginMinHGpu != null ? o.marginMinHGpu : o.marginMinH, o.marginFrac * needH);
 
 // Forecast error grows with lead time, and picking the cheapest-looking hours favours hours whose
 // error happens to be low. HP > 0 makes an hour i ahead look (1 + HP*sqrt(i/24)) dirtier when
@@ -112,7 +118,7 @@ export function scorePlacement(cat, w, c, rem, tH, fcFor, o, calib = 1) {
   const rate = rateK(w, c.prof, c.k) * calib;
   const needH = setupH(w, c.prof) + rem / rate + outputH(w);
   const deadlineH = (w.deadline - cat.T0) / H;
-  const hardH = deadlineH - tH - marginH(o, needH);
+  const hardH = deadlineH - tH - marginH(o, needH, c.prof.family);
   if (!(hardH > 0) || needH > hardH * o.maxDuty) return null;
   const availH = c.prof.family === "cpu" ? Math.max(needH / o.maxDuty, Math.min(hardH, o.cpuWindowH)) : hardH;
   const fc = fcFor(c.zone.area);
@@ -131,6 +137,7 @@ const footprint = (p, k) => ({ vms: k, cores: p.cores * k, fam: p.family, cards:
  *  after `avail` where quota is free for the whole window — so an early-deadline job that is not even
  *  released yet keeps its future capacity, and a later-deadline job may only start now if it fits
  *  around that reservation. Returns worst lateness (h) and each item's planned start. */
+let LLF = false; // fastForward order: least laxity (due - needH) first instead of earliest due
 export function fastForward(cat, t0, base, items, DT = 0.5) {
   // horizon extends well past the run end so even a hopeless job gets a finite (late) finish —
   // "infinitely late" can't get worse, which would let harmful pauses through the safety check
@@ -158,7 +165,7 @@ export function fastForward(cat, t0, base, items, DT = 0.5) {
     hold(it.fp, 0, Math.ceil((end - t0) / DT));
     start.set(it.id, it.startAt); finish.set(it.id, end);
   }
-  const waiting = items.filter((it) => !it.deployed).sort((a, b) => a.due - b.due);
+  const waiting = items.filter((it) => !it.deployed).sort((a, b) => (LLF ? (a.due - a.needH) - (b.due - b.needH) : 0) || a.due - b.due);
   for (const w of waiting) {
     const d = Math.max(1, Math.ceil(w.needH / DT));
     let s = Math.max(0, Math.ceil((w.avail - t0) / DT - 1e-9));
@@ -236,8 +243,9 @@ export function decide(cat, view, opts = {}) {
   const o = o0.latH <= o0.lowLatH ? { ...o0, ...o0.lowLat } : o0;
   // with a fast API the deadline margin can shrink (durations are deterministic; the controller's
   // latency term is kept): mock +10..+33 pts, 0 misses in 220 runs at a 1 h base
-  if (o0.latH <= o0.lowLatH && o.marginCutH > 0) o.marginMinH = Math.max(o.lowLatMarginMinH, o0.marginMinH - o.marginCutH);
+  if (o0.latH <= o0.lowLatH && o.marginCutH > 0) { o.marginMinHGpu = o0.marginMinH; o.marginMinH = Math.max(o.lowLatMarginMinH, o0.marginMinH - o.marginCutH); }
   HP = Number(o.horizonPenalty) || 0;
+  LLF = Boolean(o.llf);
   const acts = [];
   const tH = view.t;
   const relH = (j) => (j.w.release - cat.T0) / H;
@@ -284,7 +292,7 @@ export function decide(cat, view, opts = {}) {
     const wait = Math.max(0, relH(j) - tH);
     const setupLeft = j.done > 0 ? 0 : Math.max(0, setupH(j.w, prof) - (j.runH ?? 0));
     const runNeed = setupLeft + rem / rate + outputH(j.w);
-    const due = deadlineH(j) - marginH(o, runNeed);
+    const due = deadlineH(j) - marginH(o, runNeed, prof.family);
     const f = footprint(prof, k);
     addHeld(f);
     // staging may run before release (the engine allows it), so it overlaps the wait
@@ -297,7 +305,9 @@ export function decide(cat, view, opts = {}) {
       items.push(it);
       continue;
     }
-    const pausable = !o.noGate && (cpuPause || prof.family !== "cpu") && rem > 1e-6 && wait <= 0 && j.vms.every((v) => v.state === "running" || v.state === "stopped");
+    // (with pauseOutput the final output phase may pause too; its remaining time is taken as the
+    // full output time, which keeps the deadline check conservative)
+    const pausable = !o.noGate && (cpuPause || prof.family !== "cpu") && (rem > 1e-6 || o.pauseOutput) && wait <= 0 && j.vms.every((v) => v.state === "running" || v.state === "stopped");
     const fc = view.fc(zone.area);
     const sinceH = tH - (j.deployedH ?? tH);
     const availH = prof.family === "cpu" ? Math.min(due - tH, Math.max(runNeed, o.cpuWindowH - sinceH)) : due - tH;
@@ -368,7 +378,7 @@ export function decide(cat, view, opts = {}) {
     }
     const use = pick ?? single(x.list, best);
     const f = footprint(use.prof, use.k);
-    const due = deadlineH(x.j) - marginH(o, use.needH);
+    const due = deadlineH(x.j) - marginH(o, use.needH, use.prof.family);
     // every fresh job is a waiting item at `now`; the backfill decides whether it may start now.
     // A preempted job sits out its forecast dirty stretch (unless that would make it late).
     const hold = view.memo?.get(`pre:${x.j.w.id}`);
@@ -389,7 +399,7 @@ export function decide(cat, view, opts = {}) {
     const list = placements(cat, view, o, j, relH(j));
     const best = single(list, list[0]);
     if (!best) continue;
-    items.push({ id: j.w.id, fp: footprint(best.prof, best.k), needH: best.needH, due: deadlineH(j) - marginH(o, best.needH), deployed: false, avail: relH(j) });
+    items.push({ id: j.w.id, fp: footprint(best.prof, best.k), needH: best.needH, due: deadlineH(j) - marginH(o, best.needH, best.prof.family), deployed: false, avail: relH(j) });
   }
 
   // Waiting for a preferred placement (e.g. a 4-card GPU that's busy) is only OK if the projection
@@ -403,7 +413,7 @@ export function decide(cat, view, opts = {}) {
     const alt = x.list.find((c) => !(anyOk && c.doomed) && fitsQuota(cat, free, c.prof, c.k));
     if (!alt) continue;
     const saved = { ...x.it };
-    Object.assign(x.it, { fp: footprint(alt.prof, alt.k), needH: alt.needH, due: deadlineH(x.j) - marginH(o, alt.needH) });
+    Object.assign(x.it, { fp: footprint(alt.prof, alt.k), needH: alt.needH, due: deadlineH(x.j) - marginH(o, alt.needH, alt.prof.family) });
     const r = fastForward(cat, tH, base, items);
     const lateAlt = (r.finish.get(x.j.w.id) ?? Infinity) - x.it.due;
     if (lateAlt < late - 0.25) {
