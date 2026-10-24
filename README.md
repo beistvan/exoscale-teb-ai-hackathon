@@ -181,7 +181,7 @@ The dev server runs inside the container; `/` is the dashboard, `/live` is the l
 
 - A run gives you cloud key/secret, cloud/work/grid endpoints and a grid secret (the "Copy environment" button on the runner page).
 - Put them in `.env` (from `.env.example`): `EXOSCALE_API_KEY`, `EXOSCALE_API_SECRET`, `GREENOPS_CLOUD_ENDPOINT`, `GREENOPS_WORK_ENDPOINT`, `GREENOPS_GRID_ENDPOINT`, `GREENOPS_GRID_SECRET`.
-- `.env`, `env/`, `greenops-exo.json` and the orchestrator receipt are gitignored. The image never contains them: `docker run --env-file .env` injects at runtime.
+- `.env`, `env/`, `greenops-exo.json`, the orchestrator's receipt and logs (`greenops-orchestrator-state.json`, `orchestrator-run.log`, `orchestrator-events.jsonl`) and `runs-archive/` are gitignored and dockerignored. The image never contains them: `docker run --env-file .env` injects at runtime.
 - The `/live` page uses the server-side `.env` automatically (it only receives booleans, never the values); manual paste into the page still works as a fallback.
 
 ## Run commands
@@ -204,7 +204,7 @@ make dashboard     # print monitor + challenge board URLs
 
 A run is single-shot: its clock starts on the first VM create and cannot be rewound.
 
-1. **Create a fresh run** in the portal (any speed; 360× takes ≈ 20 min). **Do not run `make demo` or the starter kit's `static.py` on it** — their first VM starts the clock. (If it happens anyway, the controller adopts those VMs and replaces any that haven't started real work on a dirtier placement.)
+1. **Create a fresh run** in the portal (any speed; the official reruns use 720×, ≈ 10 min). **Do not run `make demo` or the starter kit's `static.py` on it** — their first VM starts the clock. (If it happens anyway, the controller adopts those VMs and replaces any that haven't started real work on a dirtier placement.)
 2. **Put the run's environment block in `.env`** (see "Run credentials" above).
 3. **`make mock`** — offline check of the controller: synthetic grid, simulated API lag, no credentials. Expect `failures 0/20`.
 4. **`make status`** — the run must be `READY` (clock not started).
@@ -220,11 +220,11 @@ Mock options: `node scripts/greenops/mock.mjs [seeds] --lat <ms> [--foreign --la
 
 - The clock starts on your **first accepted VM deployment**, not at run creation. Creating a run costs nothing until you deploy.
 - **Score** (frozen `greenops-score-v2`, electricity only): per workload `20000 · (Rᵢ/ΣR) / (1 + 0.75·cᵢ/Rᵢ + 0.25·C/ΣR)`, plus 5 000 if all 15 deliver on time — `Rᵢ` = 200 g/kWh × the workload's reference energy (`challenge/rules.json`), `cᵢ` its electricity CO₂, `C` the total. Fitted on the official per-workload breakdown of one run and confirmed on a second (< 0.01 points per workload); implemented as `score()` in `scripts/greenops/model.mjs`. Consequence: a kg saved on a CPU job is worth ≈ 190–240 points, on the big GPU jobs only ≈ 140.
-- **Speeds**: 1× (5 days), 60× (2 h), 360× (20 min), 720× (10 min). Speed doesn't change the scoring, but API lag (3–20 s per call under load) costs 12× more simulated time at 720× than at 60×. Official judging reruns at 720×; the controller measures the lag and adapts.
+- **Speeds**: 1× (5 days), 60× (2 h), 360× (20 min), 720× (10 min). Speed doesn't change the scoring, but API lag (3–20 s per call under load in our early runs, ≈ 10 ms in the latest ones) costs 12× more simulated time at 720× than at 60×. Official judging reruns at 720×; the controller measures the lag and adapts.
 - **Stopped VMs** draw 0 W and keep all progress, but still hold their quota. **Resuming** continues where the VM stopped, without a second boot or input staging (starter guide), so a pause costs only the API call. **Deleting** loses work since the last checkpoint (all of it for restart-from-zero jobs). Boot and input staging can run before a workload's release; compute waits for it.
-- **Grid observations** (`/carbon-intensity/history`, this run only) were published with no delay in practice: the newest point is the current hour (the guide describes a 1 h delay). Forecast misses persist for hours (hour-to-hour correlation 0.5–0.85 in DE, ES, IT, HR, AT and BG, none in FR and CH); the average forecast bias was small (0–4 %). The 6 h forecast is the 24 h one cut short; 48/72 h are rejected.
+- **Grid observations** (`/carbon-intensity/history`, this run only): in run `d84022b1` the newest published point was always stamped with the current hour, although the guide describes a 1 h publication delay. Forecast misses persisted from hour to hour (lag-1 correlation 0.5–0.85 in DE, ES, IT, HR, AT and BG; below 0.3 in FR and CH), and the average forecast bias was small (≈ 0–4 %). The 6 h forecast is the 24 h one cut short; 48/72 h are rejected.
 - The scenario's grid was the same in every run we made (a GPU job placed the same way had the same carbon to 0.03 % in two runs), so differences between runs come from the controller's decisions.
-- Attempts: unlimited, max **2 unfinished** runs per team; each run sees only its own published forecasts (fair play).
+- Attempts: unlimited, max **2 unfinished** runs per team; each run sees only its own published forecasts and observations (fair play).
 - Residency: an illegal placement attempt disqualifies the run (score 0) — the engine enforces the same rule in simulation.
 
 ## The controller (`make attempt`)
@@ -233,11 +233,11 @@ Mock options: `node scripts/greenops/mock.mjs [seeds] --lat <ms> [--foreign --la
 
 How it decides, in plain terms:
 
-1. **Where** — each job goes to the legal zone and machine with the lowest expected carbon: energy × the datacenter's PUE × the cheapest forecast hours it will need. Residency is re-checked right before every create.
+1. **Where** — each job goes to the legal zone and machine with the lowest expected carbon: energy × the datacenter's PUE × the cheapest forecast hours it will need, with a small penalty for taking a large share of the shared vCPU / GPU quota. Residency is re-checked right before every create.
 2. **When** — a job runs in the cleanest hours of the published 24 h forecast, as many as it still needs before its deadline, and is stopped (0 W) in the dirtier ones. Pauses are ranked by **points** saved, using the score formula. With a fast API, a job's VM is created about boot + input time **before** its release, so its input is loaded by the time it releases and the whole window is left for compute (if it would otherwise sit waiting, it is parked at 0 W).
 3. **Safety** — before any pause or delayed start it fast-forwards the rest of the schedule (all jobs flat-out afterwards; jobs claim the 320-vCPU quota in deadline order, including jobs not released yet). A pause is kept only if every job still finishes before its deadline minus a margin. While a job that may use several workers waits, its quota is reserved as a single worker, so it can't be pushed to the end and squeezed in.
-4. **Forecast correction** — every hour it compares this run's published observations with what its earlier forecasts said. It applies a learned per-lead-time bias (shrunk toward 0, capped at ±30 %). When this run's misses persist from hour to hour, it also carries the latest miss forward, fading at the measured rate.
-5. **Slow API** — status polls, forecasts and VM actions run in the background, so a slow call never stalls the loop. It extrapolates the simulated clock, plans for when an action will actually land, and widens margins as lag grows. Settings that only pay off with a fast API (wider CPU windows, a lower pause bar, a 1 h deadline margin for CPU jobs, pre-staging) switch on only below ≈ 0.15 simulated hours of lag (≈ 0.75 s per call at 720×).
+4. **Forecast correction** — every hour it compares this run's published observations with what its earlier forecasts said. It applies a learned per-lead-time bias (shrunk toward 0, capped at ±30 %). When this run's misses persist from hour to hour (lag-1 correlation ≥ 0.3 over ≥ 12 hourly pairs), it also carries the latest miss forward, fading at the measured rate.
+5. **Slow API** — status polls, forecasts and VM actions run in the background, so a slow call never stalls the loop. It extrapolates the simulated clock, plans for when an action will actually land, and widens margins as lag grows. Settings that only pay off with a fast API (wider CPU windows, a lower pause bar, a 1 h instead of 4 h minimum deadline margin for CPU jobs, pre-staging) switch on only below ≈ 0.15 simulated hours of lag (≈ 0.75 s per call at 720×).
 6. **Housekeeping** — deterministic VM names + a receipt; it adopts VMs it didn't create, deletes VMs as soon as their job delivers, and deletes VMs of a job whose deadline has passed.
 
 Practice runs with this controller (360× or 720×, 15/15 delivered, 0 API errors each):
@@ -250,13 +250,13 @@ Practice runs with this controller (360× or 720×, 15/15 delivered, 0 API error
 | `c2111a37` | 22 028.3 | 13.30 kg | waiting multi-worker jobs reserve quota as one worker (w-14 starts at t≈27, not t≈85) |
 | `abbd0823` | 22 023.3 | 13.35 kg | 720×; experimental 1 h deadline margin at low lag for all jobs — CPU jobs gained, GPU jobs lost |
 | `952d35db` | 22 033.3 | 13.28 kg | 720×; the 1 h low-lag margin for CPU jobs only (GPU jobs keep 4 h) |
-| `d84022b1` | **22 079.8** | **13.03 kg** | 720×; forecast correction from the run's own observations + pre-staging at low lag — w-09 −0.105 kg, w-03 −0.061, w-14 −0.047; **1st on the practice leaderboard** |
+| `d84022b1` | **22 079.8** | **13.03 kg** | 720×; forecast correction from the run's own observations + pre-staging at low lag — w-09 −0.105 kg, w-03 −0.061, w-14 −0.047; **1st on the practice leaderboard** (by 0.2 pts) |
 
 ## What was fixed / changed (this repo)
 
 - **Live controller v3** replaces the single-file v2 (kept as `scripts/orchestrator-legacy.mjs`). Problems found in v2: profile data was read from a gitignored folder, so a fresh clone (the judges' rerun) would deploy nothing; datacenter PUE was ignored (`/zone` doesn't report it); GPU jobs never shifted to cleaner hours; network calls blocked the loop, so one slow reply cost hours of simulated time at 720×; paused CPU jobs could starve a late GPU job of quota.
 - Bugs found and fixed while testing v3: a stale `READY` snapshot could start the clock more than once; the "deadline-risk" fallback could pick a placement that couldn't meet the deadline anyway; a job with no room before the run's end counted as "infinitely late", hiding harm from other pauses; the controller could mistake its own just-created VM for a foreign one.
-- Run `d84022b1` changes, mock vs the run-8 settings: +19 pts at 0.1 s lag, +6.5 at 0.3 s, +12 at 1 s and +4 at 3 s, with 0 missed deadlines. That includes the stress cases (demo-started run, idle-watt staging, slower engine, biased or persistently-wrong forecasts). Pre-staging alone cost 11–53 pts at 3–10 s lag, which is why it only runs at low lag.
+- Run `d84022b1` changes, mock vs the run-8 settings: +19 pts at 0.1 s lag, +6.5 at 0.3 s, +12 at 1 s and +4 at 3 s. There were 0 missed deadlines, also in the stress cases: demo-started run, idle-watt staging, slower engine, biased or persistently-wrong forecasts. Pre-staging alone cost 11–53 pts at 3–10 s lag, which is why it only runs at low lag.
 - Tried in the mock and **not** adopted (neutral or worse):
   - giving w-09 two GPUs: it needs 72 vCPUs while CPU jobs hold the quota, −12 to −38 pts;
   - quota-penalty variants (`scarcityMode`, `cardW`, contention-aware card shares);
@@ -276,4 +276,4 @@ Practice runs with this controller (360× or 720×, 15/15 delivered, 0 API error
 
 ## Competition entry (the actual submission)
 
-Submit a GitHub repo + immutable commit SHA + claimed practice run + reproducible build/run instructions; organizers review (source stays private to team + organizers; grant repo access manually) and rerun your controller at 720× on their infra — that rerun is your official score. `make attempt` + this README is the reproducible "container entry point launches the orchestrator" story. The CHF 50 Exoscale coupon is for hosting your own controller/live demo — it does not affect scoring (judging reruns on their own machines). There is no deployment to the challenge site: the dashboard is the run's own UI, and this webapp is a second, local, read-only window onto the same run.
+Submit a GitHub repo + immutable commit SHA + claimed practice run + reproducible build/run instructions; organizers review (source stays private to team + organizers; grant repo access manually) and rerun your controller at 720× on their infra — that rerun is your official score. `make attempt` + this README is the reproducible "container entry point launches the orchestrator" story. Best practice run so far: `d84022b1` (22 079.8 pts). It was made by the controller as committed in `bd65e74`; that commit only added comments, docs and a smaller trace format on top, so its decisions are the same. The CHF 50 Exoscale coupon is for hosting your own controller/live demo — it does not affect scoring (judging reruns on their own machines). There is no deployment to the challenge site: the dashboard is the run's own UI, and this webapp is a second, local, read-only window onto the same run.
