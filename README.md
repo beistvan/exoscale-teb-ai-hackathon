@@ -166,7 +166,7 @@ Everything below is specific to **this repo** (webapp + orchestrator), documente
 | Challenge data (shared) | `challenge/` | `catalog.json` + `rules.json` vendored from the starter kit, and `legality.mjs` — the one residency/profile check used by both the simulator and the live controller. |
 | Simulation (pure, seeded, deterministic) | `src/lib/sim` | Offline mirror of the challenge rules on the real catalog (grid carbon is synthetic): policies receive only published forecasts (`PolicyView`), residency is enforced by the engine, score uses the frozen offsets (20 000 base + 5 000 bonus, 200 gCO₂e/kWh reference). |
 | Web app (TanStack Start + Vite) | `src/routes` | Dashboard + **/live monitor** page that polls a run's APIs read-only and shows VMs, status, forecasts and charts. |
-| Docker + Make | `Dockerfile`, `Makefile`, `.dockerignore` | Run everything in a container; no host `node_modules` needed (keeps `/home` disk usage ~0). |
+| Docker + Make | `Dockerfile`, `Dockerfile.controller`, `Makefile`, `.dockerignore` | `Dockerfile`: the webapp and dev tools, so no host `node_modules` is needed (keeps `/home` disk usage ~0). `Dockerfile.controller`: the controller-only image for official reruns (see "Competition entry"). |
 | Helpers | `scripts/` | `greenops-status.mjs` (read-only run status), `make-creds.mjs` (generates `greenops-exo.json` from `.env`), `orchestrator.mjs` (entrypoint of the v3 live controller in `scripts/greenops/`: `policy.mjs`, latency-tolerant `controller.mjs`, offline `mock.mjs`), `orchestrator-legacy.mjs` (previous single-file controller, kept for reference). |
 
 ## Quick start (one command)
@@ -276,4 +276,27 @@ Practice runs with this controller (360× or 720×, 15/15 delivered, 0 API error
 
 ## Competition entry (the actual submission)
 
-Submit a GitHub repo + immutable commit SHA + claimed practice run + reproducible build/run instructions; organizers review (source stays private to team + organizers; grant repo access manually) and rerun your controller at 720× on their infra — that rerun is your official score. `make attempt` + this README is the reproducible "container entry point launches the orchestrator" story. Best practice run so far: `d84022b1` (22 079.8 pts). It was made by the controller as committed in `bd65e74`; that commit only added comments, docs and a smaller trace format on top, so its decisions are the same. The CHF 50 Exoscale coupon is for hosting your own controller/live demo — it does not affect scoring (judging reruns on their own machines). There is no deployment to the challenge site: the dashboard is the run's own UI, and this webapp is a second, local, read-only window onto the same run.
+Submit a GitHub repo + immutable commit SHA + claimed practice run + reproducible build/run instructions; organizers review (source stays private to team + organizers; grant repo access manually) and rerun your controller at 720× on their infra — that rerun is your official score. `make attempt` + this README is the reproducible "container entry point launches the orchestrator" story. Best practice run so far: `d84022b1` (22 079.8 pts). It was made by the controller as committed in `bd65e74`; that commit only added comments, docs and a smaller trace format on top, so its decisions are the same.
+
+### Reproducible build and run (official rerun)
+
+The controller needs nothing but Node.js 22 (built-ins only, no npm dependencies). `Dockerfile.controller` packages only `challenge/` (public catalog, rules, legality) and `scripts/`. Its base image is pinned by digest (`node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914`, Node 22.23). It runs as the unprivileged `node` user and writes only to `/tmp`.
+
+```bash
+# build (repo root, at the submitted commit)
+docker build -f Dockerfile.controller -t greenops-controller .
+
+# run against a fresh READY run: starts its clock, runs until all 15 workloads are delivered,
+# deletes its VMs and exits 0 (≈ 10 min at 720×)
+docker run --rm --read-only --tmpfs /tmp --env-file run.env greenops-controller
+```
+
+- **Entry point:** `node scripts/orchestrator.mjs` (the image's `ENTRYPOINT`).
+- **Configuration:** environment variables only, from the fresh run's "Copy environment" block:
+  - `EXOSCALE_API_KEY`, `EXOSCALE_API_SECRET`
+  - `GREENOPS_CLOUD_ENDPOINT`, `GREENOPS_WORK_ENDPOINT`, `GREENOPS_GRID_ENDPOINT`, `GREENOPS_GRID_SECRET`
+
+  `run.env` holds them as plain `KEY=value` lines (no `export`, no quotes), or pass each with `-e KEY`. Optional `GREENOPS_STATE_DIR` (default `/tmp`) holds the receipt `greenops-orchestrator-state.json` and the logs `orchestrator-run.log` and `orchestrator-events.jsonl`.
+- **Preflight (optional, read-only):** append `--dry` to the run command. It reads the run and prints the first decision without creating anything, so the clock does not start.
+- **Offline self-test (optional):** `docker run --rm --entrypoint node greenops-controller scripts/greenops/mock.mjs 20 --lat 3000` should report `failures 0/20`.
+- **Tested** under the judging limits: `--read-only --tmpfs /tmp --user 65534:65534 --cpus 2 --memory 1g`, both with the mock and with a `--dry` pass against a live READY run. The CHF 50 Exoscale coupon is for hosting your own controller/live demo — it does not affect scoring (judging reruns on their own machines). There is no deployment to the challenge site: the dashboard is the run's own UI, and this webapp is a second, local, read-only window onto the same run.

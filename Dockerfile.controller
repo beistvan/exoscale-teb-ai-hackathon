@@ -1,0 +1,13 @@
+# Live controller image for official reruns: plain Node 22, no npm dependencies.
+# Only the public challenge data and the controller code go in; run credentials come from the
+# environment at run time (never baked in — .dockerignore also keeps .env and run files out).
+#   build: docker build -f Dockerfile.controller -t greenops-controller .
+#   run:   docker run --rm --read-only --tmpfs /tmp --env-file run.env greenops-controller
+FROM node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
+WORKDIR /app
+COPY challenge/ ./challenge/
+COPY scripts/ ./scripts/
+# receipt + logs go to /tmp, the only writable path in the judging container
+ENV GREENOPS_STATE_DIR=/tmp
+USER node
+ENTRYPOINT ["node", "scripts/orchestrator.mjs"]
