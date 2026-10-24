@@ -1,4 +1,4 @@
-import { HORIZON_H } from "@/lib/sim/data";
+import { HORIZON_H, profileById } from "@/lib/sim/data";
 import type { RunResult, Segment } from "@/lib/sim/engine";
 import { cn } from "@/lib/utils";
 
@@ -49,7 +49,7 @@ export function Timeline({ run }: { run: RunResult }) {
                   key={i}
                   className={cn("absolute inset-y-1 rounded-[2px]", phaseClass[g.phase])}
                   style={{ left: pct(g.start), width: pct(Math.max(0.25, g.end - g.start)) }}
-                  title={`${g.phase} · ${g.zone} · ${g.workers}× ${g.profile} · ${g.start}–${g.end}h`}
+                  title={`${g.phase} · ${g.zone} · ${g.workers}× ${profileById(g.profile).label} · ${g.start}–${g.end}h`}
                 />
               ))}
               {segs

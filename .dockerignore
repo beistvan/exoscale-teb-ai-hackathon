@@ -22,3 +22,13 @@ docs
 Dockerfile
 .dockerignore
 Makefile
+**/.env
+**/.env.*
+greenops-exo.json
+*.credentials.json
+greenops-orchestrator-state.json
+orchestrator-events.jsonl
+runs-archive
+greenops-challenge-starter-kit
+exoscale-teb-ai-hackathon
+!.env.example

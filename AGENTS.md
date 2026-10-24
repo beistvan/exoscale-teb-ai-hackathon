@@ -10,7 +10,14 @@
 <!-- LOVABLE:END -->
 
 ## Architecture rules
-- Simulation lives in `src/lib/sim` as pure, deterministic TS (seeded); policies receive only `PolicyView` (forecast published at the current step) so they can never read future actuals — mirrors the challenge's fair-play rule.
+- Challenge data has one source: `challenge/catalog.json` + `challenge/rules.json` (vendored from the starter kit). The simulator (`src/lib/sim/data.ts`) and the live controller (`scripts/greenops/model.mjs`) both load it — never add a second copy or hand-typed workload/zone/profile data. To update, replace those files with the starter kit's.
+- Legality has one implementation: `challenge/legality.mjs` (`zoneLegal`, `profileLegal`). The engine and the controller both call it; change rules there only, and keep `legality.d.mts` in sync.
+- Simulation lives in `src/lib/sim` as pure, deterministic TS (seeded); policies receive only `PolicyView` (forecast published at the current step) so they can never read future actuals — mirrors the challenge's fair-play rule. Grid carbon in the simulator is synthetic (`CARBON_MODEL` in `data.ts`); the catalog has no electricity data.
 - Residency is checked in the engine: any illegal deploy attempt disqualifies the run (score 0), matching the challenge rule.
-- Live-run API calls go through the `exoGet` server function (EXO2-HMAC signing, read-only GET); credentials are passed per call and never stored.
-- Sample workload/zone data in `src/lib/sim/data.ts` stands in for the starter kit; replace it rather than adding a second data source.
+- The web app is read-only: live-run API calls go through the `exoGet` server function (EXO2-HMAC signing, GET only); credentials are passed per call and never stored.
+
+## Live controller (`scripts/orchestrator.mjs` → `scripts/greenops/`)
+- This is the only code that writes to a run (creates, stops, deletes VMs). `orchestrator-legacy.mjs` is the superseded v1, kept for reference — don't extend it.
+- A run is single-shot: the clock starts on the first create. Before any live attempt, run `make mock` (offline, synthetic grid, simulated API latency) and `make attempt-dry` (plan-only against the real run); only then `make attempt`.
+- The API can take 3–20 s per call, so controller logic must stay async and tolerate slow/lost responses (receipts + deterministic VM names). Test changes with `mock.mjs --lat`.
+- Secrets and run artifacts (`.env`, `greenops-exo.json`, `greenops-orchestrator-state.json`, `orchestrator-events.jsonl`, `runs-archive/`) are gitignored and dockerignored; keep it that way.

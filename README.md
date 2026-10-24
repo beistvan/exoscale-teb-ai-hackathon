@@ -163,10 +163,11 @@ Everything below is specific to **this repo** (webapp + orchestrator), documente
 
 | Part | Location | Purpose |
 |---|---|---|
-| Simulation (pure, seeded, deterministic) | `src/lib/sim` | Offline mirror of the challenge rules: policies receive only published forecasts (`PolicyView`), residency is enforced by the engine, score uses the frozen offsets (20 000 base + 5 000 bonus, 200 gCO₂e/kWh reference). |
+| Challenge data (shared) | `challenge/` | `catalog.json` + `rules.json` vendored from the starter kit, and `legality.mjs` — the one residency/profile check used by both the simulator and the live controller. |
+| Simulation (pure, seeded, deterministic) | `src/lib/sim` | Offline mirror of the challenge rules on the real catalog (grid carbon is synthetic): policies receive only published forecasts (`PolicyView`), residency is enforced by the engine, score uses the frozen offsets (20 000 base + 5 000 bonus, 200 gCO₂e/kWh reference). |
 | Web app (TanStack Start + Vite) | `src/routes` | Dashboard + **/live monitor** page that polls a run's APIs read-only and shows VMs, status, forecasts and charts. |
 | Docker + Make | `Dockerfile`, `Makefile`, `.dockerignore` | Run everything in a container; no host `node_modules` needed (keeps `/home` disk usage ~0). |
-| Helpers | `scripts/` | `greenops-status.mjs` (read-only run status), `make-creds.mjs` (generates `greenops-exo.json` from `.env`), `orchestrator.mjs` (15-workload carbon-aware live controller). |
+| Helpers | `scripts/` | `greenops-status.mjs` (read-only run status), `make-creds.mjs` (generates `greenops-exo.json` from `.env`), `orchestrator.mjs` (entrypoint of the v3 live controller in `scripts/greenops/`: `policy.mjs`, latency-tolerant `controller.mjs`, offline `mock.mjs`), `orchestrator-legacy.mjs` (previous single-file controller, kept for reference). |
 
 ## Quick start (one command)
 
@@ -192,6 +193,7 @@ make starter       # clone the official starter kit (once)
 make demo          # official 2-workload demo  — STARTS THE CLOCK (use a fresh run)
 make attempt       # 15-workload carbon-aware orchestrator — STARTS THE CLOCK
 make attempt-dry   # plan-only preview of the orchestrator (safe, no writes)
+make mock          # offline mock of the engine + slow API driving the real controller (no credentials)
 make cleanup-run   # delete this controller's VMs via its receipt (after a run)
 make dashboard     # print monitor + challenge board URLs
 ```

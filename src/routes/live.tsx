@@ -61,11 +61,8 @@ function decodeUserData(u?: string) {
   }
 }
 function workloadFrom(u: string) {
-  // Real run IDs look like "w-01-dach-research"; the sim catalog uses "wl-01"…"wl-15" in the same order.
-  const m = u.match(/w-(\d{2})/);
-  if (!m) return null;
-  const simId = `wl-${m[1]}`;
-  return WORKLOADS.some((w) => w.id === simId) ? simId : null;
+  // The sim catalog uses the real run IDs ("w-01-dach-research"); user-data embeds one of them.
+  return WORKLOADS.find((w) => u.includes(w.id))?.id ?? null;
 }
 function countryOf(zoneName: string) {
   return zoneName.split("-")[0]?.toUpperCase() ?? "";

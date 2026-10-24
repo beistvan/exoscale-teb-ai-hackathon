@@ -1,11 +1,11 @@
-import { BOOT_H, DT, HORIZON_H, ZONES, feasibleProfiles, legalZones, type Workload } from "./data";
+import { DT, HORIZON_H, ZONES, feasibleProfiles, legalZones, type Workload } from "./data";
 import { STEPS } from "./carbon";
 import { fitsQuota, ratePerHour, type Action, type Policy, type PolicyView, type Usage } from "./engine";
 import { profileById, zoneById } from "./data";
 
 /** Total hours from deploy to delivered output, given remaining work. */
 export function durationH(w: Workload, profileId: string, workers: number, remaining: number) {
-  return BOOT_H + w.setupH + remaining / ratePerHour(w, profileId, workers) + w.outputH;
+  return profileById(profileId).bootH + w.setupH + remaining / ratePerHour(w, profileId, workers) + w.outputH;
 }
 const ceilStep = (h: number) => Math.ceil(h / DT - 1e-9);
 
@@ -22,12 +22,12 @@ function remainingOf(s: PolicyView["workloads"][number]) {
 function addUsage(u: Usage, profileId: string, workers: number): Usage {
   const p = profileById(profileId);
   const g = { ...u.gpus };
-  if (p.family) g[p.family] += p.gpus * workers;
+  if (p.kind === "gpu") g[p.family] = (g[p.family] ?? 0) + p.gpus * workers;
   return { vms: u.vms + workers, vcpu: u.vcpu + p.vcpu * workers, gpus: g };
 }
 
 // Baseline home-zone preference (a typical static deployment), regardless of carbon.
-const HOME = ["de-fra-1", "at-vie-1", "at-vie-2", "de-muc-1", "ch-gva-2", "ch-dk-2", "fr-par-x", "nl-ams-x", "bg-sof-1", "pl-waw-x", "se-sto-x"];
+const HOME = ["de-fra-1", "de-muc-1", "at-vie-1", "at-vie-2", "ch-gva-2", "ch-dk-2", "it-mil-1", "hr-zag-1", "es-mad-1", "bg-sof-1", "fr-par-1"];
 
 /** Baseline: fixed first legal zone, start on release, fastest profile, minimum workers that meet the deadline. */
 export const baselinePolicy: Policy = {

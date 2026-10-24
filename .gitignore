@@ -40,3 +40,6 @@ greenops-exo.json
 env/
 greenops-challenge-starter-kit/
 greenops-orchestrator-state.json
+orchestrator-events.jsonl
+runs-archive/
+exoscale-teb-ai-hackathon/

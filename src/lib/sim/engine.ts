@@ -1,5 +1,5 @@
 import {
-  BOOT_H, DT, HORIZON_H, QUOTA, WORKLOADS, isLegal, profileById, zoneById,
+  DT, HORIZON_H, QUOTA, WORKLOADS, isLegal, profileById, profileFits, zoneById,
   type GpuFamily, type Workload,
 } from "./data";
 import { STEPS, actualIntensity, makeForecaster } from "./carbon";
@@ -67,13 +67,13 @@ export const BASE_POINTS = 20000;
 export const BONUS_POINTS = 5000;
 
 export function usageOf(vms: readonly VM[]): Usage {
-  const u: Usage = { vms: 0, vcpu: 0, gpus: { a5000: 0, a40: 0, rtxpro6000: 0 } };
+  const u: Usage = { vms: 0, vcpu: 0, gpus: {} };
   for (const vm of vms) {
     if (vm.deleted !== null) continue;
     const p = profileById(vm.profile);
     u.vms++;
     u.vcpu += p.vcpu;
-    if (p.family) u.gpus[p.family] += p.gpus;
+    if (p.kind === "gpu") u.gpus[p.family] = (u.gpus[p.family] ?? 0) + p.gpus;
   }
   return u;
 }
@@ -82,7 +82,7 @@ export function fitsQuota(u: Usage, profileId: string, workers: number) {
   const p = profileById(profileId);
   if (u.vms + workers > QUOTA.vms) return false;
   if (u.vcpu + p.vcpu * workers > QUOTA.vcpu) return false;
-  if (p.family && u.gpus[p.family] + p.gpus * workers > QUOTA.gpus[p.family]) return false;
+  if (p.kind === "gpu" && (u.gpus[p.family] ?? 0) + p.gpus * workers > (QUOTA.gpus[p.family] ?? 0)) return false;
   return true;
 }
 
@@ -176,6 +176,14 @@ export function runSimulation(policy: Policy, seed: number, forecastError = 0.25
         events.push({ hour, kind: "violation", text: `${a.wl} attempted in ${a.zone} — residency violation, run disqualified` });
         continue;
       }
+      if (!profileFits(s.w, a.profile, a.zone)) {
+        events.push({ hour, kind: "reject", text: `${a.wl} rejected: profile not offered in ${a.zone} or unsuitable` });
+        continue;
+      }
+      if (a.workers < 1 || a.workers > s.w.maxWorkers) {
+        events.push({ hour, kind: "reject", text: `${a.wl} rejected: ${a.workers} workers (max ${s.w.maxWorkers})` });
+        continue;
+      }
       if (s.phase !== "pending" || hour < s.w.release) {
         events.push({ hour, kind: "reject", text: `${a.wl} not deployable now` });
         continue;
@@ -190,8 +198,8 @@ export function runSimulation(policy: Policy, seed: number, forecastError = 0.25
         vms.push(vm);
         ids.push(vm.id);
       }
-      Object.assign(s, { vmIds: ids, phase: "boot", phaseLeft: BOOT_H, zone: a.zone, profile: a.profile, workers: a.workers, sinceCkpt: 0 });
-      events.push({ hour, kind: "deploy", text: `${s.w.id} → ${a.zone} · ${a.workers}× ${a.profile}${a.reason ? ` — ${a.reason}` : ""}` });
+      Object.assign(s, { vmIds: ids, phase: "boot", phaseLeft: profileById(a.profile).bootH, zone: a.zone, profile: a.profile, workers: a.workers, sinceCkpt: 0 });
+      events.push({ hour, kind: "deploy", text: `${s.w.id} → ${a.zone} · ${a.workers}× ${profileById(a.profile).label}${a.reason ? ` — ${a.reason}` : ""}` });
     }
 
     // advance physics for one step
