@@ -50,6 +50,8 @@ export const DEFAULTS = {
   // and scored 5 pts below run 6 — CPU jobs gained, GPU jobs lost — so GPUs keep the full margin
   marginCutH: 0, lowLatMarginMinH: 1,
   marginCpuOnly: true, // the cut applies to CPU jobs only; GPU jobs keep the full margin
+  marginFracGpu: null, // GPU jobs' runtime-proportional margin (null: marginFrac)
+  prestageNoDefer: false, // with prestage: stage a job before its release even if the current hour looks dirty
   pauseOutput: false,  // allow pausing during the final output phase (it otherwise always runs)
   llf: false,          // reserve queued jobs least-laxity-first (due - need) instead of earliest-due-first
   gpuTightW: 0,        // GPU placements needing more than gpuTightAt of their window are penalised by this per unit
@@ -79,7 +81,10 @@ export const DEFAULTS = {
 const H = 3.6e6;
 // GPU jobs can keep the larger margin (marginCpuOnly): live run 7 showed GPUs given the thin margin
 // postponing their last hours into forecast-cheap hours that turned out dirtier
-const marginH = (o, needH, fam = "cpu") => Math.max(fam !== "cpu" && o.marginCpuOnly && o.marginMinHGpu != null ? o.marginMinHGpu : o.marginMinH, o.marginFrac * needH);
+const marginH = (o, needH, fam = "cpu") => {
+  const gpu = fam !== "cpu";
+  return Math.max(gpu && o.marginCpuOnly && o.marginMinHGpu != null ? o.marginMinHGpu : o.marginMinH, (gpu && o.marginFracGpu != null ? o.marginFracGpu : o.marginFrac) * needH);
+};
 
 // Forecast error grows with lead time, and picking the cheapest-looking hours favours hours whose
 // error happens to be low. HP > 0 makes an hour i ahead look (1 + HP*sqrt(i/24)) dirtier when
@@ -386,7 +391,8 @@ export function decide(cat, view, opts = {}) {
     const it = { id: x.j.w.id, fp: f, needH: use.needH, due, deployed: false, avail: holdUntil };
     if (pick) { free.vms += f.vms; free.cores += f.cores; if (f.cards) free.cards[f.fam] = (free.cards[f.fam] ?? 0) + f.cards; }
     const fc = view.fc(use.zone.area);
-    const gateNow = o.noGate || use.forced || !pick || (!cpuPause && use.prof.family === "cpu") || gate(fc, use.needH, Math.min(use.hardH, o.cpuWindowH))
+    const preRelease = o.prestage && o.prestageNoDefer && relH(x.j) > tH + 1e-9;
+    const gateNow = o.noGate || use.forced || !pick || preRelease || (!cpuPause && use.prof.family === "cpu") || gate(fc, use.needH, Math.min(use.hardH, o.cpuWindowH))
       || withinNoise(fc, use.needH, Math.min(use.hardH, o.cpuWindowH), o.noiseBand);
     const value = pick && !gateNow ? (use.prof.watts * use.k / 1000) * use.zone.pue * hourSaving(fc, use.needH, Math.min(use.hardH, o.cpuWindowH)) : 0;
     if (view.memo) { if (!pick) view.memo.set(x.j.w.id, { zone: use.zone.slug, prof: use.prof.id, k: use.k }); else view.memo.delete(x.j.w.id); }
@@ -481,6 +487,8 @@ export function decide(cat, view, opts = {}) {
         else Object.assign(it, saved);
       }
     }
+    if (o.trace) for (const d of deployed) if (d.pausable && !d.gateRun && d.it.fp.fam !== "cpu" && !(d.value > 0 && d.value * wt(d.j.w.id) >= bar(d.it.fp)))
+      o.trace({ wl: d.j.w.id, t: +tH.toFixed(2), why: "bar", value: +(d.value * wt(d.j.w.id)).toFixed(2), bar: +bar(d.it.fp).toFixed(2), blocked });
     if (safe && !o.strictPauses) for (const c of cands) { if (!preempted.has(c.it.id)) (c.kind === "pause" ? paused : deferred).add(c.it.id); }
     else {
       const lateOf = (r, it) => (r.finish.get(it.id) ?? Infinity) - it.due;
@@ -493,8 +501,9 @@ export function decide(cat, view, opts = {}) {
         const saved = { ...c.it };
         if (c.kind === "pause") c.it.startAt = tH + q; else c.it.avail = tH + q;
         const r = fastForward(cat, tH, base, items);
-        let ok = lateOf(r, c.it) <= -buffer;
-        if (ok) for (const it of items) if (lateOf(r, it) > Math.max(base0.get(it.id), -cushion) + 1e-6) { ok = false; break; }
+        let ok = lateOf(r, c.it) <= -buffer, by = ok ? null : "own";
+        if (ok) for (const it of items) if (lateOf(r, it) > Math.max(base0.get(it.id), -cushion) + 1e-6) { ok = false; by = it.id; break; }
+        if (!ok && o.trace && c.it.fp.fam !== "cpu") o.trace({ wl: c.it.id, t: +tH.toFixed(2), why: "projection", by, cushion, blocked, value: +c.value.toFixed(2) });
         if (ok) { (c.kind === "pause" ? paused : deferred).add(c.it.id); plan = r; }
         else Object.assign(c.it, saved);
       }

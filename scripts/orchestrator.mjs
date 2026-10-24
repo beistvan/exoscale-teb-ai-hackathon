@@ -29,6 +29,7 @@ if (missing.length) { console.error(`Missing env: ${missing.join(", ")}`); proce
 
 const writable = (d) => { try { fs.accessSync(d, fs.constants.W_OK); return true; } catch { return false; } };
 const STATE_DIR = env.GREENOPS_STATE_DIR || (writable(process.cwd()) ? process.cwd() : "/tmp");
+try { fs.mkdirSync(STATE_DIR, { recursive: true }); } catch {} // a missing log dir must not crash the run
 const _si = argv.indexOf("--state");
 const STATE = _si >= 0 && argv[_si + 1] ? argv[_si + 1] : path.join(STATE_DIR, "greenops-orchestrator-state.json");
 const logFile = fs.createWriteStream(path.join(STATE_DIR, "orchestrator-run.log"), { flags: "a" });

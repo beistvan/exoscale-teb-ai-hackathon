@@ -55,12 +55,15 @@ Practice runs (15/15 delivered on time, 0 API errors each):
 | `abbd0823` | 22 023.3 | 13.35 kg | 720×; 1 h deadline margin at low lag for all jobs: CPU jobs gained, GPU jobs lost |
 | `952d35db` | 22 033.3 | 13.28 kg | 720×; the 1 h low-lag margin for CPU jobs only (GPU jobs keep 4 h) |
 | `d84022b1` | **22 079.8** | **13.03 kg** | 720×; forecast correction from the run's own observations + pre-staging at low lag (w-09 −0.105 kg, w-03 −0.061, w-14 −0.047) |
+| `4c6e96e2` | 22 061.1 | 13.14 kg | 720×; test: the current hour's published observation used from t=0 (`nowcastLead0`). Swiss jobs gained, but knock-on quota timing cost the GPU and Spanish jobs. Off by default |
+| `10b214d2` | 22 078.9 | 13.04 kg | 360×; the test above + a 9 % GPU early-phase margin (`marginFracGpu: 0.09`). On par with `d84022b1`; off by default |
 
 Tried in the mock and not adopted (neutral or worse):
 - giving the big GPU job w-09 two GPUs: it needs 72 vCPUs while CPU jobs hold the quota, −12 to −38 pts;
 - quota-penalty variants;
 - stricter pause rules while jobs queue;
-- smaller runtime margins for CPU jobs.
+- smaller runtime margins for CPU jobs;
+- staging before release even in dirty hours (`prestageNoDefer`) and pausing the output phase (`pauseOutput`).
 
 Pre-staging cost 11–53 pts at 3–10 s API lag, so it only runs at low lag. Quota contention is the largest remaining loss in the mock (≈ 127 pts versus unlimited quota).
 
@@ -75,7 +78,7 @@ Verified from the platform docs, the API and our runs:
   - A kg saved on a CPU job is worth ≈ 190–240 points, on the big GPU jobs only ≈ 140.
 - **Stopped VMs** draw 0 W and keep all progress, but still hold their quota. **Resuming** continues without a second boot or input staging. **Deleting** loses work since the last checkpoint (all of it for restart-from-zero jobs). Boot and input staging can run before a workload's release; compute waits for it.
 - **Grid observations** (`/carbon-intensity/history`, own run only): the newest published point carried the current hour's timestamp (the guide describes a 1 h delay). Forecast misses persisted from hour to hour (lag-1 correlation 0.5–0.85 in DE, ES, IT, HR, AT and BG; below 0.3 in FR and CH), and the average forecast bias was small (≈ 0–4 %). The 6 h forecast is the 24 h one cut short.
-- The scenario's grid is the same in every run, so differences between runs come from the controller's decisions. For the same reason, **no grid data is stored or reused across runs** (fair play: only the controlled run's own published data is used, at decision time).
+- The scenario's grid is the same in every run, so differences between runs come from the controller's decisions. A given controller version is deterministic: runs `4c6e96e2` (720×) and `10b214d2` (360×) produced identical per-job results for every job their settings didn't touch. Small decision changes still cascade through the shared quota and move the total by ±10–20 points. For the same reason, **no grid data is stored or reused across runs** (fair play: only the controlled run's own published data is used, at decision time).
 
 ## Development
 
@@ -86,6 +89,8 @@ Verified from the platform docs, the API and our runs:
 | Offline mock (synthetic grid, simulated API lag) | `scripts/greenops/mock.mjs` |
 | Web dashboard + TypeScript simulator | `src/routes` (dashboard, read-only `/live` run monitor), `src/lib/sim` |
 | Containers | `Dockerfile.controller` (controller), `Dockerfile` (web app and tools), `Makefile` |
+
+`orchestrator-events.jsonl` has one JSON line per decision and per API reply. It also logs every GPU pause the clean-hour rule wanted but a safety check refused, with the reason (`"k":"why"`).
 
 **Credentials are never committed.** Copy `.env.example` to `.env` and fill in the run's "Copy environment" block. `.env`, `greenops-exo.json`, the receipt, the logs and `runs-archive/` are gitignored and dockerignored.
 

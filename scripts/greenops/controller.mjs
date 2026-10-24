@@ -35,6 +35,7 @@ export const CONTROL = {
                          // the hour-to-hour persistence this run's own misses show (off if they don't persist)
   nowcastMinN: 12,       // ...needs this many consecutive-hour pairs of observed lead-0 misses
   nowcastMinRho: 0.3,    // ...and at least this lag-1 autocorrelation
+  nowcastLead0: false,   // when the current hour's observation is already published, use it for that hour
 };
 
 export class Controller {
@@ -44,7 +45,8 @@ export class Controller {
     // much simulated time passed in between — for reviewing a 720x run afterwards
     this.event = (o) => { try { event({ wall: new Date(this.clock.now()).toISOString(), ...o }); } catch {} };
     this.o = { ...CONTROL, ...opts };
-    this.policyOpts = policyOpts;
+    // GPU pauses the clean-hour rule wanted but the safety checks refused (why, and who blocked) → trace
+    this.policyOpts = { trace: (x) => this.event({ k: "why", ...x }), ...policyOpts };
     this.st.vms ??= {}; this.st.seq ??= 0; this.st.deleted ??= [];
     this.deleted = new Set(this.st.deleted);
     this.snap = null; this.statusInflight = 0; this.lastStatusStart = -1e15;
@@ -193,7 +195,9 @@ export class Controller {
       if (!c) return null;
       const b = this.o.learnBias ? this.biasFor(area, nowHour) : null;
       const cap = 2 * this.o.biasCap;
+      const obsNow = this.o.nowcastLead0 ? this.obs.get(area)?.get(hourStart) : undefined;
       const val = (p) => {
+        if (obsNow > 0 && p.t === hourStart) return obsNow;
         if (!b) return p.v;
         const tau = (p.t - this.cat.T0) / H;
         let e = b[Math.max(0, Math.min(24, Math.round(tau - (c.vh ?? c.hour))))];
