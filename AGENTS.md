@@ -12,6 +12,7 @@
 ## Architecture rules
 - Challenge data has one source: `challenge/catalog.json` + `challenge/rules.json` (vendored from the starter kit). The simulator (`src/lib/sim/data.ts`) and the live controller (`scripts/greenops/model.mjs`) both load it — never add a second copy or hand-typed workload/zone/profile data. To update, replace those files with the starter kit's.
 - Legality has one implementation: `challenge/legality.mjs` (`zoneLegal`, `profileLegal`). The engine and the controller both call it; change rules there only, and keep `legality.d.mts` in sync.
+- `controller-rs/` (experimental Rust port of the live controller) mirrors it in `src/legality.rs` and compiles in `challenge/catalog.json` + `rules.json`. `cargo test` fails if the port disagrees with `legality.mjs` or the JS mock; change the JS side first, then the port.
 - Simulation lives in `src/lib/sim` as pure, deterministic TS (seeded); policies receive only `PolicyView` (forecast published at the current step) so they can never read future actuals — mirrors the challenge's fair-play rule. Grid carbon in the simulator is synthetic (`CARBON_MODEL` in `data.ts`); the catalog has no electricity data.
 - Residency is checked in the engine: any illegal deploy attempt disqualifies the run (score 0), matching the challenge rule.
 - The web app is read-only: live-run API calls go through the `exoGet` server function (EXO2-HMAC signing, GET only); credentials are passed per call and never stored.

@@ -1,0 +1,8 @@
+# Build context for controller-rs/Dockerfile (context = repo root): everything is excluded except
+# what the build needs — no .env, receipts, logs, target/ or node_modules can enter the image.
+*
+!challenge/catalog.json
+!challenge/rules.json
+!controller-rs/Cargo.toml
+!controller-rs/Cargo.lock
+!controller-rs/src/

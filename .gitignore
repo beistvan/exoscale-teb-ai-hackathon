@@ -43,3 +43,6 @@ greenops-orchestrator-state.json
 orchestrator-events.jsonl
 runs-archive/
 exoscale-teb-ai-hackathon/
+
+# Rust controller build output
+controller-rs/target/

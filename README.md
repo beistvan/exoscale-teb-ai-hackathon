@@ -129,3 +129,24 @@ The same steps run inside the web-app container via `make mock`, `make attempt-d
 - oracles: `MOCK_FC_PERFECT=24` (perfect forecast of that many hours), `MOCK_CORES=400` (another vCPU quota); `--opt forceProfile='{"w-09-eu-large-model":"gpurtx6000pro.medium"}'` pins a machine.
 
 **Web dashboard (optional):** `make run` builds and starts it (default http://localhost:3005/). `/live` polls a run read-only; credentials stay server-side.
+
+## Rust controller (experimental)
+
+`controller-rs/` is a Rust port of the live controller, for type-checked changes and much faster offline test batches. The JS controller above stays the submission.
+
+- **Same decisions as the JS controller.** In the offline mock every compared seed is bit-identical to `scripts/greenops/mock.mjs`: points, per-job grams and action counts, 380 seeds over 12 configurations (latencies 100 ms–10 s, foreign VMs, late start, forecast misses, tight quota). See [`controller-rs/PARITY.md`](controller-rs/PARITY.md). `cargo test` checks legality against `challenge/legality.mjs` on all 3 630 (workload, zone, profile) combinations and 20 000 random cases. It also checks the API requests against `liveapi.mjs` byte for byte (EXO2 signatures included), mock seeds against the JS mock, and the live loop end to end against a local fake API.
+- **≈ 17× faster per seed** on one core (≈ 50 ms instead of ≈ 0.9 s for a 120 h run), ≈ 70 seeds/s on all 10 cores of an M-series Mac.
+- **Scope:** the policy's defaults only (the experimental switches aren't ported). The receipt and log files are the same as the JS controller's, so either one can resume or `destroy` the other's VMs. `--dry` was checked against a real READY run (same first decision as the JS `--dry`); no live attempt has been made with it.
+- **Platform note:** V8's `Math.log/exp/cos/pow` give slightly different results on arm64 and x86-64 Node (FMA contraction in V8's C++), so the JS mock's numbers differ by CPU. The Rust mock reproduces either variant (`--fma 1|0`; default: the host's).
+
+```bash
+cargo build --release --manifest-path controller-rs/Cargo.toml
+controller-rs/target/release/greenops-controller mock 200 --lat 3000      # offline batch, all cores
+controller-rs/target/release/greenops-controller --dry                     # read-only preview of the .env run
+cargo test --release --manifest-path controller-rs/Cargo.toml              # needs node 22 for the JS comparisons
+node controller-rs/parity/parity.mjs --extended                            # regenerates controller-rs/PARITY.md
+
+docker build -f controller-rs/Dockerfile -t greenops-controller-rs .
+docker run --rm --read-only --tmpfs /tmp --user 65534:65534 --cpus 2 --memory 1g greenops-controller-rs mock 20 --lat 3000
+docker run --rm --read-only --tmpfs /tmp --env-file run.env greenops-controller-rs --dry
+```

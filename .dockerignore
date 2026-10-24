@@ -32,3 +32,4 @@ runs-archive
 greenops-challenge-starter-kit
 exoscale-teb-ai-hackathon
 !.env.example
+controller-rs/target
