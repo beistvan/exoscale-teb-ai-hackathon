@@ -36,6 +36,10 @@ export const CONTROL = {
   nowcastMinN: 12,       // ...needs this many consecutive-hour pairs of observed lead-0 misses
   nowcastMinRho: 0.3,    // ...and at least this lag-1 autocorrelation
   nowcastLead0: false,   // when the current hour's observation is already published, use it for that hour
+  obsShiftH: 0,          // which hour an observation stamped h describes: h (0) or h-1 (1); "auto" = whichever
+                         // fits this run's own forecasts better (leads 0-3). Live runs 6e5310e5/51b1f33d: 0 fits
+                         // 4-19 % better from hour 9 on, so 0 is the default
+  obsShiftMinN: 24,      // ...once this many comparable forecast/observation pairs exist (until then: 0)
 };
 
 export class Controller {
@@ -52,6 +56,7 @@ export class Controller {
     this.snap = null; this.statusInflight = 0; this.lastStatusStart = -1e15;
     this.fc = new Map(); this.fcInflight = new Set();
     this.fcLog = new Map(); this.obs = new Map(); this.histHour = new Map(); this.histInflight = new Set(); this.biasCache = { hour: -1, b: new Map() };
+    this.dataVer = 0; this.align = { ver: -1, sh: 0, mse: null };
     this.inCreate = new Map(); // wl -> { zone, prof, k, left }
     this.inVm = new Map();     // vmId -> verb in flight
     this.override = new Map(); // vmId -> { state, wallAck, tAck }
@@ -97,7 +102,7 @@ export class Controller {
           this.event({ k: "fc", area: a, hour, vh, n: pts.length });
           const log = this.fcLog.get(a) ?? new Map(); log.set(vh, pts); this.fcLog.set(a, log);
           for (const h of log.keys()) if (h < hour - 72) log.delete(h);
-          this.biasCache = { hour: -1, b: new Map() }; // new evidence → recompute corrections
+          this.biasCache = { hour: -1, b: new Map() }; this.dataVer++; // new evidence → recompute corrections
         }
       }).catch(() => {}).finally(() => this.fcInflight.delete(a));
     }
@@ -113,13 +118,37 @@ export class Controller {
         if (!pts?.length) return;
         const m = this.obs.get(a) ?? new Map(); for (const p of pts) m.set(p.t, p.v); this.obs.set(a, m);
         this.histHour.set(a, hour);
-        this.biasCache = { hour: -1, b: new Map() };
+        this.biasCache = { hour: -1, b: new Map() }; this.dataVer++;
         // publication lag as seen by this run (hours between now and the newest published hour)
         const newest = Math.max(...pts.map((p) => p.t));
         const bb = this.biasFor(a, hour);
-        this.event({ k: "hist", area: a, hour, lagH: +(hour - (newest - this.cat.T0) / H).toFixed(2), n: m.size, b0: +bb[0].toFixed(3), b12: +bb[12].toFixed(3), anom: bb.anom ? { rho: +bb.anom.rho.toFixed(2), a0: +bb.anom.a0.toFixed(3), t0: bb.anom.t0 } : null });
+        this.event({ k: "hist", area: a, hour, sh: this.shiftH(), mse: this.align.mse?.map((x) => +x.toFixed(5)), lagH: +(hour - (newest - this.cat.T0) / H).toFixed(2), n: m.size, b0: +bb[0].toFixed(3), b12: +bb[12].toFixed(3), anom: bb.anom ? { rho: +bb.anom.rho.toFixed(2), a0: +bb.anom.a0.toFixed(3), t0: bb.anom.t0 } : null });
       }).catch(() => {}).finally(() => this.histInflight.delete(a));
     }
+  }
+
+  /** Hours to add to a target hour to find its observation's stamp (0: stamped with its own hour, 1: one
+   *  hour late). "auto": compare this run's forecasts (leads 0-3) with both readings, keep the closer one. */
+  shiftH() {
+    const fixed = this.o.obsShiftH;
+    if (fixed !== "auto") return Number(fixed) || 0;
+    if (this.align.ver === this.dataVer) return this.align.sh;
+    const se = [0, 0], n = [0, 0];
+    for (const [area, log] of this.fcLog) {
+      const obs = this.obs.get(area); if (!obs) continue;
+      for (const pts of log.values()) for (let i = 0; i < Math.min(4, pts.length); i++) {
+        const p = pts[i], o0 = obs.get(p.t), o1 = obs.get(p.t + H);
+        if (!(o0 > 0 && o1 > 0 && p.v > 0)) continue; // same pairs for both readings
+        se[0] += Math.log(p.v / o0) ** 2; se[1] += Math.log(p.v / o1) ** 2; n[0]++; n[1]++;
+      }
+    }
+    // sticky: start on 0 (the published stamp), switch only on clear evidence (>= 15 % lower error), so
+    // near-ties early in a run don't flip the corrections hour by hour (seen live: 0/1 alternating, h1-h8)
+    const prev = this.align.sh ?? 0, m0 = se[0] / Math.max(1, n[0]), m1 = se[1] / Math.max(1, n[1]);
+    let sh = prev;
+    if (n[0] >= this.o.obsShiftMinN) { if (prev === 0 && m1 < 0.85 * m0) sh = 1; else if (prev === 1 && m0 < 0.85 * m1) sh = 0; }
+    this.align = { ver: this.dataVer, sh, mse: n[0] ? [m0, m1] : null, n: n[0] };
+    return sh;
   }
 
   /** Mean relative forecast error per lead hour for an area (forecast / observed - 1), shrunk and capped. */
@@ -127,9 +156,9 @@ export class Controller {
     if (this.biasCache.hour !== hour) this.biasCache = { hour, b: new Map() };
     if (this.biasCache.b.has(area)) return this.biasCache.b.get(area);
     const sum = new Float64Array(25), cnt = new Float64Array(25);
-    const obs = this.obs.get(area), log = this.fcLog.get(area);
+    const obs = this.obs.get(area), log = this.fcLog.get(area), sh = this.shiftH() * H;
     if (obs && log) for (const [h0, pts] of log) for (const p of pts) {
-      const o = obs.get(p.t); if (!(o > 0)) continue;
+      const o = obs.get(p.t + sh); if (!(o > 0)) continue;
       const lead = Math.round((p.t - (this.cat.T0 + h0 * H)) / H); if (lead < 0 || lead > 24) continue;
       sum[lead] += p.v / o - 1; cnt[lead]++;
     }
@@ -142,11 +171,11 @@ export class Controller {
   /** The latest observed lead-0 miss beyond the learned bias, and how strongly misses persist from one
    *  hour to the next in this run (lag-1 autocorrelation). null while they don't measurably persist. */
   anomalyFor(area, b) {
-    const log = this.fcLog.get(area), obs = this.obs.get(area);
+    const log = this.fcLog.get(area), obs = this.obs.get(area), sh = this.shiftH() * H;
     if (!log || !obs) return null;
     const a = new Map();
     for (const [h0, pts] of log) {
-      const p = pts[0]; const o = p && p.t === this.cat.T0 + h0 * H ? obs.get(p.t) : undefined;
+      const p = pts[0]; const o = p && p.t === this.cat.T0 + h0 * H ? obs.get(p.t + sh) : undefined;
       if (o > 0) a.set(h0, p.v / o - 1 - b[0]);
     }
     let sxy = 0, sxx = 0, n = 0, last = -Infinity;
@@ -195,7 +224,7 @@ export class Controller {
       if (!c) return null;
       const b = this.o.learnBias ? this.biasFor(area, nowHour) : null;
       const cap = 2 * this.o.biasCap;
-      const obsNow = this.o.nowcastLead0 ? this.obs.get(area)?.get(hourStart) : undefined;
+      const obsNow = this.o.nowcastLead0 ? this.obs.get(area)?.get(hourStart + this.shiftH() * H) : undefined;
       const val = (p) => {
         if (obsNow > 0 && p.t === hourStart) return obsNow;
         if (!b) return p.v;

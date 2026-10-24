@@ -57,13 +57,24 @@ Practice runs (15/15 delivered on time, 0 API errors each):
 | `d84022b1` | **22 079.8** | **13.03 kg** | 720×; forecast correction from the run's own observations + pre-staging at low lag (w-09 −0.105 kg, w-03 −0.061, w-14 −0.047) |
 | `4c6e96e2` | 22 061.1 | 13.14 kg | 720×; test: the current hour's published observation used from t=0 (`nowcastLead0`). Swiss jobs gained, but knock-on quota timing cost the GPU and Spanish jobs. Off by default |
 | `10b214d2` | 22 078.9 | 13.04 kg | 360×; the test above + a 9 % GPU early-phase margin (`marginFracGpu: 0.09`). On par with `d84022b1`; off by default |
+| `6e5310e5` | 22 066.6 | 13.12 kg | 720×; `4c6e96e2`'s test + automatic observation alignment (`obsShiftH: "auto"`). It found observations are stamped with their own hour, i.e. the default 0 |
+| `51b1f33d` | 22 068.1 | 13.10 kg | 720×; the same + the 9 % GPU early-phase margin |
+
+The four test runs (`4c6e96e2` … `51b1f33d`) all used the current-hour observation from t=0. All four made the Swiss jobs cleaner (w-04: 0.256 → 0.248 kg) and the GPU jobs dirtier (w-09: 4.012 → 4.02–4.07 kg). Pausing the Swiss jobs more precisely made them hold quota longer, which squeezed the other jobs. `d84022b1`'s settings stay the default.
 
 Tried in the mock and not adopted (neutral or worse):
 - giving the big GPU job w-09 two GPUs: it needs 72 vCPUs while CPU jobs hold the quota, −12 to −38 pts;
 - quota-penalty variants;
 - stricter pause rules while jobs queue;
 - smaller runtime margins for CPU jobs;
-- staging before release even in dirty hours (`prestageNoDefer`) and pausing the output phase (`pauseOutput`).
+- staging before release even in dirty hours (`prestageNoDefer`), opening the staging window earlier (`prestageExtraH`) and pausing the output phase (`pauseOutput`);
+- preempting (deleting) paused quick-restart jobs to free quota (`preempt`), −12 to −20 pts.
+
+Oracle ceilings, measured in the mock with forecast misses calibrated to live summary statistics (`MOCK_FC_ANOM_AREA`; synthetic grid):
+- a perfect 24 h forecast: +45 pts; a perfect 72 h forecast: +84 pts. Not reachable: forecasts stop at 24 h, and the forecast correction already uses what the observations reveal.
+- 25 % / 50 % more vCPU quota: +29 / +62 pts (unlimited: +114). A smarter allocation can only recover part of this. During the busy middle of run `d84022b1`, 35 % of the held quota sat in stopped VMs, mostly while every job paused in the same dirty hours.
+- one perfect-hindsight zone move per job (migration): −0.4 % (w-09) to −1.4 % (w-06) carbon, so not worth the risk.
+- forcing two GPUs on w-09 / w-07: −10.6 / −42 pts.
 
 Pre-staging cost 11–53 pts at 3–10 s API lag, so it only runs at low lag. Quota contention is the largest remaining loss in the mock (≈ 127 pts versus unlimited quota).
 
@@ -111,6 +122,8 @@ The same steps run inside the web-app container via `make mock`, `make attempt-d
 - `MOCK_QUOTA=big` — no quota;
 - `MOCK_FC_BIAS=0.3` — biased forecasts;
 - `MOCK_FC_ANOM=0.08,0.8` — persistent forecast misses;
-- `MOCK_HIST_LAG=0` — observation publication lag.
+- `MOCK_HIST_LAG=0` — observation publication lag; `MOCK_HIST_SHIFT=1` — observations stamped one hour late;
+- `MOCK_FC_ANOM_AREA='{"ES":[0.19,0.79],...}'` — per-area forecast-miss size and persistence;
+- oracles: `MOCK_FC_PERFECT=24` (perfect forecast of that many hours), `MOCK_CORES=400` (another vCPU quota); `--opt forceProfile='{"w-09-eu-large-model":"gpurtx6000pro.medium"}'` pins a machine.
 
 **Web dashboard (optional):** `make run` builds and starts it (default http://localhost:3005/). `/live` polls a run read-only; credentials stay server-side.

@@ -195,7 +195,10 @@ export function fastForward(cat, t0, base, items, DT = 0.5) {
 function placements(cat, view, o, j, tPlan) {
   const rem = Math.max(0, j.w.required - j.done);
   const cal = view.calib?.[j.w.unit] ?? 1;
-  const scored = candidates(cat, j.w).map((c) => scorePlacement(cat, j.w, c, rem, tPlan, view.fc, o, cal)).filter(Boolean);
+  let scored = candidates(cat, j.w).map((c) => scorePlacement(cat, j.w, c, rem, tPlan, view.fc, o, cal)).filter(Boolean);
+  // (experiment only) forceProfile: { wl: "family.size" } pins a job's machine — oracle tests in the mock
+  const forced = o.forceProfile?.[j.w.id];
+  if (forced) { const f = scored.filter((c) => c.prof.label === forced && c.k === 1); if (f.length) scored = f; }
   // rank = estimated grams x a quota-scarcity factor: a placement that takes a big share of the
   // vCPU or GPU-family quota blocks other jobs (e.g. a 4-card RTX locks out the other RTX job)
   // quota footprint: "cores" = how much it holds at once; "coreHours" = how long it holds it (a 2-card
@@ -365,7 +368,9 @@ export function decide(cat, view, opts = {}) {
   const free = { vms: view.usage.vms, cores: view.usage.cores, cards: { ...view.usage.cards } };
   // jobs released by now — plus, with pre-staging, jobs releasing within their boot + input time,
   // so staging is done by the release and compute starts at once
-  const lead = (j) => (o.prestage ? (120 + j.w.inputS) / 3600 + o.latH + 0.1 : 0);
+  // prestageExtraH: open the pre-release staging window this many hours earlier, so the clean-hour
+  // rule can pick a cleaner time to load the input (the staged VM then waits stopped, at 0 W)
+  const lead = (j) => (o.prestage ? (120 + j.w.inputS) / 3600 + o.latH + 0.1 + (o.prestageExtraH ?? 0) : 0);
   const releasedOrSoon = (j) => relH(j) <= tH + lead(j) + 1e-9;
   const waitingNow = open.filter((j) => !j.vms.length && releasedOrSoon(j))
     .map((j) => ({ j, list: placements(cat, view, o, j, Math.max(tH, relH(j) - lead(j))) })).filter((x) => x.list.length);

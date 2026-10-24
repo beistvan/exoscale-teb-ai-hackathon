@@ -25,7 +25,7 @@ const STAGING_IDLE = process.env.MOCK_STAGING === "idle"; // power model variant
 // The real engine boots and stages input before a job's release (observed live: a VM created at
 // t=0 for a t=4 job was computing at t=4.0); compute waits for release. MOCK_PRESTAGE=0 disables.
 const PRESTAGE = process.env.MOCK_PRESTAGE !== "0";
-const HIST_LAG = Number(process.env.MOCK_HIST_LAG ?? 2);
+const HIST_LAG = Number(process.env.MOCK_HIST_LAG ?? 2), HIST_SHIFT = Number(process.env.MOCK_HIST_SHIFT ?? 0);
 
 function rng(seed) { let s = (seed >>> 0) || 1; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 2 ** 32; }; }
 function gauss(r) { return Math.sqrt(-2 * Math.log(r() + 1e-12)) * Math.cos(2 * Math.PI * r()); }
@@ -33,7 +33,7 @@ function gauss(r) { return Math.sqrt(-2 * Math.log(r() + 1e-12)) * Math.cos(2 * 
 // Generic area archetypes (mean, relative amplitude, hour of daily peak), randomised per seed.
 const ARCH = { AT: [155, 0.2, 0], BG: [240, 0.25, 17], CH: [45, 0.3, 23], DE: [380, 0.2, 23], ES: [145, 0.25, 23], FR: [75, 0.3, 5], HR: [290, 0.27, 8], IT: [300, 0.2, 4] };
 
-function makeGrid(seed, hours = 160) {
+export function makeGrid(seed, hours = 160) {
   const r = rng(seed * 7919 + 1);
   const actual = {};
   for (const [a, [m0, amp0, pk0]] of Object.entries(ARCH)) {
@@ -48,11 +48,14 @@ function makeGrid(seed, hours = 160) {
   }
   // MOCK_FC_ANOM="sigma,rho": the actuals carry a persistent hour-to-hour deviation (AR(1) over target
   // hours) that the forecast doesn't know — a stand-in for a smooth forecast missing local swings
+  // MOCK_FC_ANOM_AREA='{"ES":[sigma,rho],...}' sets it per area (areas not listed use MOCK_FC_ANOM)
   const [AS, AR] = String(process.env.MOCK_FC_ANOM ?? "0,0").split(",").map(Number);
+  const perArea = process.env.MOCK_FC_ANOM_AREA ? JSON.parse(process.env.MOCK_FC_ANOM_AREA) : {};
   const base = {};
   for (const a of Object.keys(ARCH)) {
     base[a] = actual[a].slice();
-    if (AS > 0) { let x = 0; actual[a] = actual[a].map((v) => { x = AR * x + Math.sqrt(1 - AR * AR) * AS * gauss(r); return Math.max(5, v * (1 + x)); }); }
+    const [sg, rh] = perArea[a] ?? [AS, AR];
+    if (sg > 0) { let x = 0; actual[a] = actual[a].map((v) => { x = rh * x + Math.sqrt(1 - rh * rh) * sg * gauss(r); return Math.max(5, v * (1 + x)); }); }
   }
   const fcErr = {};
   for (const a of Object.keys(ARCH)) {
@@ -63,7 +66,11 @@ function makeGrid(seed, hours = 160) {
   // stand-in for real forecasts that are systematically off, to test bias learning
   const B = Number(process.env.MOCK_FC_BIAS ?? 0);
   const sign = Object.fromEntries(Object.keys(ARCH).map((a) => [a, r() < 0.5 ? -1 : 1]));
-  const fc = (a, tH) => { const h0 = Math.floor(tH); return Array.from({ length: 24 }, (_, i) => base[a][Math.min(hours - 1, h0 + i)] * (1 + fcErr[a][Math.min(hours - 1, h0)][i]) * (1 + sign[a] * B * (i / 24))); };
+  // MOCK_FC_PERFECT=H (oracle only): the forecast is the actual series, H hours long
+  const PERF = Number(process.env.MOCK_FC_PERFECT ?? 0);
+  const fc = PERF > 0
+    ? (a, tH) => { const h0 = Math.floor(tH); return Array.from({ length: PERF }, (_, i) => actual[a][Math.min(hours - 1, h0 + i)]); }
+    : (a, tH) => { const h0 = Math.floor(tH); return Array.from({ length: 24 }, (_, i) => base[a][Math.min(hours - 1, h0 + i)] * (1 + fcErr[a][Math.min(hours - 1, h0)][i]) * (1 + sign[a] * B * (i / 24))); };
   return { actual, fc };
 }
 
@@ -174,7 +181,8 @@ class Engine {
   forecast(area) { const h0 = Math.floor(this.t); return this.grid.fc(area, this.t).map((v, i) => ({ t: this.cat.T0 + (h0 + i) * H, v })); }
   // published observations: hours ending at least 1 h ago, most recent 24
   // (MOCK_HIST_LAG=L: hours up to floor(t) - L are published; default 2 = the guide's 1 h after the hour ends)
-  history(area) { const h1 = Math.floor(this.t) + 1 - HIST_LAG; const out = []; for (let h = Math.max(0, h1 - 24); h < h1; h++) out.push({ t: this.cat.T0 + h * H, v: this.grid.actual[area][h] }); return out; }
+  // (MOCK_HIST_SHIFT=1: each value is stamped one hour late — hour h's point holds hour h-1's actual)
+  history(area) { const h1 = Math.floor(this.t) + 1 - HIST_LAG; const out = []; for (let h = Math.max(0, h1 - 24); h < h1; h++) out.push({ t: this.cat.T0 + h * H, v: this.grid.actual[area][Math.max(0, h - HIST_SHIFT)] }); return out; }
 }
 
 function makeMockApi(engine, clock, latMs, r) {
@@ -229,6 +237,8 @@ export async function simulate(seed, { latMs = 3000, policyOpts = {}, ctlOpts = 
   const cat = loadCatalog();
   // diagnostic: MOCK_QUOTA=big removes the shared quota (to measure what contention costs)
   if (process.env.MOCK_QUOTA === "big") cat.quota = { vms: 500, cores: 100000, cards: Object.fromEntries(Object.keys(cat.quota.cards).map((f) => [f, 100])) };
+  // (oracle) MOCK_CORES=N: a different vCPU quota (default 320)
+  if (process.env.MOCK_CORES) cat.quota.cores = Number(process.env.MOCK_CORES);
   cat.T0 = Date.parse("2025-09-30T00:00:00Z");
   const grid = makeGrid(seed);
   const clock = new VClock();
