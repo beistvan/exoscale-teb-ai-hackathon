@@ -163,10 +163,11 @@ Everything below is specific to **this repo** (webapp + orchestrator), documente
 
 | Part | Location | Purpose |
 |---|---|---|
-| Simulation (pure, seeded, deterministic) | `src/lib/sim` | Offline mirror of the challenge rules: policies receive only published forecasts (`PolicyView`), residency is enforced by the engine, score uses the frozen offsets (20 000 base + 5 000 bonus, 200 gCO₂e/kWh reference). |
+| Challenge data (shared) | `challenge/` | `catalog.json` + `rules.json` vendored from the starter kit, and `legality.mjs` — the one residency/profile check used by both the simulator and the live controller. |
+| Simulation (pure, seeded, deterministic) | `src/lib/sim` | Offline mirror of the challenge rules on the real catalog (grid carbon is synthetic): policies receive only published forecasts (`PolicyView`), residency is enforced by the engine, score uses the frozen offsets (20 000 base + 5 000 bonus, 200 gCO₂e/kWh reference). |
 | Web app (TanStack Start + Vite) | `src/routes` | Dashboard + **/live monitor** page that polls a run's APIs read-only and shows VMs, status, forecasts and charts. |
 | Docker + Make | `Dockerfile`, `Makefile`, `.dockerignore` | Run everything in a container; no host `node_modules` needed (keeps `/home` disk usage ~0). |
-| Helpers | `scripts/` | `greenops-status.mjs` (read-only run status), `make-creds.mjs` (generates `greenops-exo.json` from `.env`), `orchestrator.mjs` (15-workload carbon-aware live controller). |
+| Helpers | `scripts/` | `greenops-status.mjs` (read-only run status), `make-creds.mjs` (generates `greenops-exo.json` from `.env`), `orchestrator.mjs` (entrypoint of the v3 live controller in `scripts/greenops/`: `policy.mjs`, latency-tolerant `controller.mjs`, offline `mock.mjs`), `orchestrator-legacy.mjs` (previous single-file controller, kept for reference). |
 
 ## Quick start (one command)
 
@@ -192,33 +193,63 @@ make starter       # clone the official starter kit (once)
 make demo          # official 2-workload demo  — STARTS THE CLOCK (use a fresh run)
 make attempt       # 15-workload carbon-aware orchestrator — STARTS THE CLOCK
 make attempt-dry   # plan-only preview of the orchestrator (safe, no writes)
+make mock          # offline mock of the engine + slow API driving the real controller (no credentials)
 make cleanup-run   # delete this controller's VMs via its receipt (after a run)
 make dashboard     # print monitor + challenge board URLs
 ```
 
 `make attempt` and `attempt-dry` run `scripts/orchestrator.mjs` inside the app container (`bun`), so the host needs nothing besides Docker and the `.env`.
 
-## How runs work (facts, verified from the platform docs and API)
+### Running a scoring attempt, step by step
+
+A run is single-shot: its clock starts on the first VM create and cannot be rewound.
+
+1. **Create a fresh run** in the portal (any speed; 360× takes ≈ 20 min). **Do not run `make demo` or the starter kit's `static.py` on it** — their first VM starts the clock. (If it happens anyway, the controller adopts those VMs and replaces any that haven't started real work on a dirtier placement.)
+2. **Put the run's environment block in `.env`** (see "Run credentials" above).
+3. **`make mock`** — offline check of the controller: synthetic grid, simulated API lag, no credentials. Expect `failures 0/20`.
+4. **`make status`** — the run must be `READY` (clock not started).
+5. **`make attempt-dry`** — reads the real run (zones, live profiles, templates, forecasts) and prints the first decision; it changes nothing on the run.
+6. **`make attempt`** — starts the clock and runs unattended until all 15 workloads are delivered, then deletes its VMs and exits. Progress: `orchestrator-run.log` (readable) and `orchestrator-events.jsonl` (one JSON line per decision and per API reply, with latency and simulated hours elapsed).
+7. **If interrupted**, rerun `make attempt`: the receipt (`greenops-orchestrator-state.json`) lets it pick up its own VMs. `make cleanup-run` deletes them.
+
+Without Docker (Node ≥ 22): `node scripts/orchestrator.mjs [--dry]` with the same variables in the environment or `.env`. `GREENOPS_STATE_DIR` sets where the receipt and logs go (default: the working directory, or `/tmp` if it isn't writable — as in the judging container).
+
+Mock options: `node scripts/greenops/mock.mjs [seeds] --lat <ms> [--foreign --late <hours>] [--opt key=value] [--ctl key=value]`; env `MOCK_STAGING=idle` (alternative power model), `MOCK_QUOTA=big` (no quota, diagnostic). It reports mean points (exact score formula), kg CO₂e, a perfect-foresight lower bound and missed deadlines.
+
+## How runs work (facts, verified from the platform docs, the API and our runs)
 
 - The clock starts on your **first accepted VM deployment**, not at run creation. Creating a run costs nothing until you deploy.
-- **Score cap: 20 000 base + 5 000 completion bonus = 25 000 points** (frozen `greenops-score-v2` cohort; electricity-usage basis, 200 gCO₂e/kWh reference, bounded quality = ¾ local + ¼ shared cost). Practically, all 15 workloads must complete before their deadlines to reach >20k.
-- Speeds: 1× (5 days), 60× (2 h), 360× (20 min), 720× (10 min for the full window). **Speed does not change the score** — official judging reruns at 720×, so develop at 720×.
+- **Score** (frozen `greenops-score-v2`, electricity only): per workload `20000 · (Rᵢ/ΣR) / (1 + 0.75·cᵢ/Rᵢ + 0.25·C/ΣR)`, plus 5 000 if all 15 deliver on time — `Rᵢ` = 200 g/kWh × the workload's reference energy (`challenge/rules.json`), `cᵢ` its electricity CO₂, `C` the total. Fitted on the official per-workload breakdown of one run and confirmed on a second (< 0.01 points per workload); implemented as `score()` in `scripts/greenops/model.mjs`. Consequence: a kg saved on a CPU job is worth ≈ 190–240 points, on the big GPU jobs only ≈ 140.
+- **Speeds**: 1× (5 days), 60× (2 h), 360× (20 min), 720× (10 min). Speed doesn't change the scoring, but API lag (3–20 s per call under load) costs 12× more simulated time at 720× than at 60×. Official judging reruns at 720×; the controller measures the lag and adapts.
+- **Stopped VMs** draw 0 W and keep all progress, but still hold their quota. **Deleting** loses work since the last checkpoint (all of it for restart-from-zero jobs). Boot and input staging can run before a workload's release; compute waits for it.
+- The scenario's grid was the same in every run we made (a GPU job placed the same way had the same carbon to 0.03 % in two runs), so differences between runs come from the controller's decisions.
 - Attempts: unlimited, max **2 unfinished** runs per team; each run sees only its own published forecasts (fair play).
 - Residency: an illegal placement attempt disqualifies the run (score 0) — the engine enforces the same rule in simulation.
 
-## The orchestrator (`make attempt`)
+## The controller (`make attempt`)
 
-Carbon-aware, quote-safe, idempotent 15-workload controller:
+`scripts/orchestrator.mjs` is the entrypoint; the logic lives in `scripts/greenops/` (`policy.mjs` decides, `controller.mjs` executes, `model.mjs` holds the catalog, legality and score, `mock.mjs` tests it offline). It only uses the public catalog and rules (`challenge/`), its own run's status and its own run's currently published forecasts.
 
-- Reads its own run's `/work/v1/status`, `/zone`, `/instance-type` (live profile catalog), `/template` and grid forecasts only — never future actuals.
-- Deploys the **cleanest legal (zone, profile, workers) option available now**, ordered by deadline urgency, respecting release times and quotas (20 VMs / 320 vCPU / GPU-family caps), with residency checks. (Forecast-window *waiting* is in the offline policy; the live planner is deliberately conservative about deadlines.)
-- Deterministic VM names + a local receipt (`greenops-orchestrator-state.json`, gitignored) make reruns recover accepted creates; VMs of delivered workloads are deleted automatically.
-- EXO2 signing follows the official spec (message = `METHOD path` + body + query-values + headers + expiry; signature = base64 HMAC-SHA256; `signed-query-args` pragma for query params).
+How it decides, in plain terms:
 
-**Verification status (evidence, not claims):** the read path (zones, per-zone instance lists, instance-type, template, work status, grid forecasts) was exercised end-to-end against the live run — a completed run reports `COMPLETED` + 2/15 delivered and the orchestrator exits 0. The POST/DELETE signatures were accepted by the server (it returned business errors, not auth errors — a completed run rejects all creates with `unknown or unavailable instance type` for bogus and real ids alike). **Writes have not yet been exercised against a live run**, so the first `make attempt` on a fresh run is the real test of create/delete semantics.
+1. **Where** — each job goes to the legal zone and machine with the lowest expected carbon: energy × the datacenter's PUE × the cheapest forecast hours it will need. Residency is re-checked right before every create.
+2. **When** — a job runs in the cleanest hours of the published 24 h forecast, as many as it still needs before its deadline, and is stopped (0 W) in the dirtier ones. Pauses are ranked by **points** saved, using the score formula.
+3. **Safety** — before any pause or delayed start it fast-forwards the rest of the schedule (all jobs flat-out afterwards; jobs claim the 320-vCPU quota in deadline order, including jobs not released yet). A pause is kept only if every job still finishes before its deadline minus a margin.
+4. **Slow API** — status polls, forecasts and VM actions run in the background, so a slow call never stalls the loop. It extrapolates the simulated clock, plans for when an action will actually land, and widens margins as lag grows. Settings that only pay off with a fast API switch on only below ≈ 0.15 simulated hours of lag.
+5. **Housekeeping** — deterministic VM names + a receipt; it adopts VMs it didn't create, deletes VMs as soon as their job delivers, and deletes VMs of a job whose deadline has passed.
+
+Practice runs with this controller (360×, 15/15 delivered, 0 API errors each):
+
+| Run | Score | Electricity CO₂ | What changed |
+|---|---|---|---|
+| `427b8228` | 21 820.5 | 14.29 kg | first clean run of this controller (run pre-started by the demo) |
+| `f625ae89` | 21 913.6 | 13.83 kg | pauses ranked by points (exact score formula) |
+| `2dd99b04` | 21 972.5 | 13.57 kg | wider CPU windows and a lower pause bar while API lag is low |
 
 ## What was fixed / changed (this repo)
 
+- **Live controller v3** replaces the single-file v2 (kept as `scripts/orchestrator-legacy.mjs`). Problems found in v2: profile data was read from a gitignored folder, so a fresh clone (the judges' rerun) would deploy nothing; datacenter PUE was ignored (`/zone` doesn't report it); GPU jobs never shifted to cleaner hours; network calls blocked the loop, so one slow reply cost hours of simulated time at 720×; paused CPU jobs could starve a late GPU job of quota.
+- Bugs found and fixed while testing v3: a stale `READY` snapshot could start the clock more than once; the "deadline-risk" fallback could pick a placement that couldn't meet the deadline anyway; a job with no room before the run's end counted as "infinitely late", hiding harm from other pauses; the controller could mistake its own just-created VM for a foreign one.
 - `tsconfig.json` gained `"node"` in `types` (server-side `process.env` access).
 - `src/lib/live.functions.ts` / `src/routes/live.tsx`: run credentials read server-side from `.env`; live page auto-detects the config and starts polling; secrets never reach the browser.
 - `Makefile` `stop`/`run` force-remove stale containers (a stopped container previously blocked `make run` with a name conflict).

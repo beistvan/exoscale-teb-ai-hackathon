@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Timeline } from "@/components/sim/Timeline";
-import { DT, QUOTA, WORKLOADS, ZONES } from "@/lib/sim/data";
+import { DT, HORIZON_H, QUOTA, WORKLOADS, ZONES, profileById, residencyLabel } from "@/lib/sim/data";
 import { runSimulation, type RunResult } from "@/lib/sim/engine";
 import { baselinePolicy, makeCarbonAwarePolicy } from "@/lib/sim/policies";
 
@@ -15,7 +15,7 @@ export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
       { title: "GreenOps Simulator — carbon-aware scheduling" },
-      { name: "description", content: "Simulate 15 workloads over 120 hours in 11 European zones and compare a baseline against a carbon-aware scheduler." },
+      { name: "description", content: "Simulate the 15 challenge workloads over 120 hours in 11 European zones and compare a baseline against a carbon-aware scheduler." },
       { property: "og:title", content: "GreenOps Simulator — carbon-aware scheduling" },
       { property: "og:description", content: "Compare baseline vs carbon-aware cloud orchestration on simulated European grid carbon." },
     ],
@@ -42,7 +42,7 @@ function Simulator() {
 
   const intensityData = useMemo(() => {
     const rows = [];
-    for (let h = 0; h < 120; h++) {
+    for (let h = 0; h < HORIZON_H; h++) {
       const row: Record<string, number> = { h };
       for (const z of ZONES) row[z.id] = Math.round(run.actual[z.id]![h / DT]!);
       rows.push(row);
@@ -67,7 +67,8 @@ function Simulator() {
             Same work. <span className="text-primary">Less carbon.</span>
           </h1>
           <p className="mt-3 max-w-xl text-muted-foreground">
-            15 workloads, 120 simulated hours, 11 zones across 8 countries and a shared budget of {QUOTA.vms} VMs /{" "}
+            {WORKLOADS.length} challenge workloads, {HORIZON_H} simulated hours, {ZONES.length} zones across{" "}
+            {new Set(ZONES.map((z) => z.country)).size} countries and a shared budget of {QUOTA.vms} VMs /{" "}
             {QUOTA.vcpu} vCPU. The scheduler only sees the forecast published at each hour.
           </p>
         </div>
@@ -158,11 +159,11 @@ function Simulator() {
             {run.workloads.map((s) => (
               <tr key={s.w.id} className="border-b border-border/50">
                 <td className="py-2 pr-3 font-mono-data text-muted-foreground">{s.w.id}</td>
-                <td className="pr-3">{s.w.name}{s.w.note && <div className="text-xs text-muted-foreground">{s.w.note}</div>}</td>
+                <td className="pr-3">{s.w.name}</td>
                 <td className="pr-3 font-mono-data">{s.w.release}–{s.w.deadline}h</td>
-                <td className="pr-3 font-mono-data text-xs">{s.w.countries.join(" ")}</td>
-                <td className="pr-3 text-xs">{s.w.kind.toUpperCase()}{s.w.minGpuMemGB ? ` ≥${s.w.minGpuMemGB}GB` : ""} · setup {s.w.setupH}h · {s.w.checkpointH ? `ckpt ${s.w.checkpointH}h` : "no ckpt"}</td>
-                <td className="pr-3 font-mono-data text-xs">{s.zone ? `${s.zone} · ${s.workers}× ${s.profile}` : "—"}</td>
+                <td className="pr-3 font-mono-data text-xs">{residencyLabel(s.w)}</td>
+                <td className="pr-3 text-xs">{s.w.kind.toUpperCase()}{s.w.minVram ? ` ≥${s.w.minVram}GB` : ""} · setup {s.w.setupH}h · {s.w.checkpointH ? `ckpt ${s.w.checkpointH}h` : "no ckpt"}</td>
+                <td className="pr-3 font-mono-data text-xs">{s.zone ? `${s.zone} · ${s.workers}× ${profileById(s.profile!).label}` : "—"}</td>
                 <td className="pr-3 font-mono-data">{s.restarts}</td>
                 <td className="pr-3 font-mono-data">{(s.carbonG / 1000).toFixed(2)}</td>
                 <td className="pr-3 font-mono-data">{Math.round(run.score.perWorkload[s.w.id] ?? 0)}</td>
@@ -186,7 +187,8 @@ function Simulator() {
       </section>
 
       <p className="text-xs text-muted-foreground">
-        Sample data shaped after the brief ({WORKLOADS.length} workloads, {ZONES.length} zones). Score uses an approximate model of the frozen policy: up to
+        Workloads, zones, profiles and quotas come from the challenge catalog ({WORKLOADS.length} workloads, {ZONES.length} zones); grid
+        carbon is synthetic. Score uses an approximate model of the frozen policy: up to
         20,000 base points weighted by reference energy plus a 5,000 bonus when everything completes on time. Results are game results, not real emissions.
       </p>
     </main>

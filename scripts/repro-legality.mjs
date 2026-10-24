@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const KIT = path.join(process.cwd(), "greenops-challenge-starter-kit/challenge/catalog.json");
+const KIT = path.join(process.cwd(), "challenge/catalog.json");
 const c = JSON.parse(fs.readFileSync(KIT, "utf8"));
 const EU = new Set(["AT","BE","BG","HR","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"]);
 const country = (s = "",) => String(s).split("-")[0].toUpperCase() || s;

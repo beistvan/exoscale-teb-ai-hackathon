@@ -1,121 +1,182 @@
-// Sample challenge data. Mirrors the brief's shape (15 workloads, 11 zones / 8 countries,
-// 20 VMs, 320 vCPU, GPU family quotas). Replace with the starter kit's files when available.
+// Challenge data for the simulator, loaded from the vendored starter-kit files in challenge/
+// (the same catalog the live controller in scripts/greenops uses). Legality comes from the
+// shared challenge/legality.mjs so the simulator and the live run can never disagree.
+//
+// The catalog has no electricity data, so each zone gets a SYNTHETIC carbon profile below
+// (CARBON_MODEL). Only the simulator uses it; the live run reads the grid API.
+import catalog from "../../../challenge/catalog.json";
+import rules from "../../../challenge/rules.json";
+import { profileLegal, zoneLegal } from "../../../challenge/legality.mjs";
 
-export type Country = "CH" | "DE" | "AT" | "FR" | "NL" | "BG" | "SE" | "PL";
-export const EU_COUNTRIES: Country[] = ["DE", "AT", "FR", "NL", "BG", "SE", "PL"];
-export const DACH: Country[] = ["DE", "AT", "CH"];
+export type Country = string;
+export type GpuFamily = string;
 
 export interface Zone {
-  id: string;
+  id: string; // slug, as used by the cloud API
+  name: string;
   country: Country;
+  eu: boolean;
   fictional: boolean;
-  baseIntensity: number; // gCO2/kWh mean
-  solarDip: number; // 0..1 midday reduction
-  windVolatility: number; // weather noise amplitude
   pue: number;
-  gpuFamilies: GpuFamily[];
+  baseIntensity: number; // synthetic gCO2/kWh mean
+  solarDip: number; // synthetic 0..1 midday reduction
+  windVolatility: number; // synthetic weather noise amplitude
 }
-
-export type GpuFamily = "a5000" | "a40" | "rtxpro6000";
-
-export const ZONES: Zone[] = [
-  { id: "ch-gva-2", country: "CH", fictional: false, baseIntensity: 45, solarDip: 0.15, windVolatility: 0.15, pue: 1.25, gpuFamilies: ["a5000", "a40"] },
-  { id: "ch-dk-2", country: "CH", fictional: false, baseIntensity: 55, solarDip: 0.2, windVolatility: 0.15, pue: 1.3, gpuFamilies: ["a5000", "rtxpro6000"] },
-  { id: "de-fra-1", country: "DE", fictional: false, baseIntensity: 380, solarDip: 0.45, windVolatility: 0.45, pue: 1.3, gpuFamilies: ["a5000", "a40", "rtxpro6000"] },
-  { id: "de-muc-1", country: "DE", fictional: false, baseIntensity: 360, solarDip: 0.5, windVolatility: 0.4, pue: 1.28, gpuFamilies: ["a40"] },
-  { id: "at-vie-1", country: "AT", fictional: false, baseIntensity: 140, solarDip: 0.35, windVolatility: 0.3, pue: 1.3, gpuFamilies: ["a5000"] },
-  { id: "at-vie-2", country: "AT", fictional: false, baseIntensity: 150, solarDip: 0.35, windVolatility: 0.3, pue: 1.22, gpuFamilies: ["a40", "rtxpro6000"] },
-  { id: "bg-sof-1", country: "BG", fictional: false, baseIntensity: 420, solarDip: 0.3, windVolatility: 0.2, pue: 1.4, gpuFamilies: ["a5000"] },
-  { id: "fr-par-x", country: "FR", fictional: true, baseIntensity: 60, solarDip: 0.1, windVolatility: 0.2, pue: 1.3, gpuFamilies: ["a40"] },
-  { id: "se-sto-x", country: "SE", fictional: true, baseIntensity: 30, solarDip: 0.05, windVolatility: 0.35, pue: 1.15, gpuFamilies: ["a5000", "a40"] },
-  { id: "nl-ams-x", country: "NL", fictional: true, baseIntensity: 320, solarDip: 0.3, windVolatility: 0.5, pue: 1.25, gpuFamilies: ["a5000"] },
-  { id: "pl-waw-x", country: "PL", fictional: true, baseIntensity: 650, solarDip: 0.2, windVolatility: 0.25, pue: 1.4, gpuFamilies: ["rtxpro6000"] },
-];
 
 export interface Profile {
-  id: string;
+  id: string; // catalog UUID, as used by the cloud API
+  label: string; // e.g. "cpu.mega"
   kind: "cpu" | "gpu";
+  family: GpuFamily | "cpu";
   vcpu: number;
-  family?: GpuFamily;
   gpus: number;
   gpuMemGB: number;
-  kw: number; // active draw per VM
+  kw: number; // active IT draw per VM, before PUE
   idleKw: number;
   throughput: number; // work units per hour
+  unit: string;
+  bootH: number;
+  zones: string[];
 }
-
-export const PROFILES: Profile[] = [
-  { id: "standard.large", kind: "cpu", vcpu: 4, gpus: 0, gpuMemGB: 0, kw: 0.09, idleKw: 0.04, throughput: 1 },
-  { id: "cpu.extra-large", kind: "cpu", vcpu: 16, gpus: 0, gpuMemGB: 0, kw: 0.3, idleKw: 0.1, throughput: 4 },
-  { id: "cpu.mega", kind: "cpu", vcpu: 32, gpus: 0, gpuMemGB: 0, kw: 0.55, idleKw: 0.18, throughput: 8 },
-  { id: "gpua5000.small", kind: "gpu", family: "a5000", vcpu: 12, gpus: 1, gpuMemGB: 24, kw: 0.35, idleKw: 0.1, throughput: 10 },
-  { id: "gpua40.small", kind: "gpu", family: "a40", vcpu: 12, gpus: 1, gpuMemGB: 48, kw: 0.42, idleKw: 0.12, throughput: 14 },
-  { id: "gpua40.medium", kind: "gpu", family: "a40", vcpu: 24, gpus: 2, gpuMemGB: 96, kw: 0.82, idleKw: 0.22, throughput: 27 },
-  { id: "gpurtxpro6000.small", kind: "gpu", family: "rtxpro6000", vcpu: 24, gpus: 1, gpuMemGB: 96, kw: 0.68, idleKw: 0.15, throughput: 30 },
-];
-
-export const QUOTA = {
-  vms: 20,
-  vcpu: 320,
-  gpus: { a5000: 8, a40: 8, rtxpro6000: 4 } as Record<GpuFamily, number>,
-};
 
 export interface Workload {
-  id: string;
+  id: string; // real workload ID (w-01-…)
   name: string;
   kind: "cpu" | "gpu";
-  release: number; // hour
+  release: number; // hour since SCENARIO_START
   deadline: number; // hour, output must be delivered by then
-  work: number; // work units (throughput-hours)
+  work: number; // work units
+  unit: string;
   setupH: number;
   outputH: number;
-  countries: Country[]; // allowed countries
-  minGpuMemGB: number;
+  residency: string; // "EU" | "CH" | "ANYWHERE"
+  allowed: Country[] | null;
+  forbidden: Country[];
+  profileIds: string[] | null;
+  families: string[] | null;
+  minVram: number;
   maxWorkers: number;
-  parallelEff: number; // per extra worker efficiency factor
+  parallelEff: number; // per extra worker efficiency factor (1 - sync_overhead)
   checkpointH: number | null; // null = restart loses everything
-  refEnergyKWh: number; // fixed reference energy (score weight) — real values from the run's /api/rules
-  realId?: string; // workload ID on the live runner (w-01-…), for user-data binding and status mapping
-  note?: string;
+  refEnergyKWh: number; // fixed reference energy (score weight) from rules.json
 }
 
-const ALL: Country[] = ["CH", ...EU_COUNTRIES];
+// Synthetic per-zone carbon profile (sim only). Rough shape of each country's grid.
+const CARBON_MODEL: Record<string, Pick<Zone, "baseIntensity" | "solarDip" | "windVolatility">> = {
+  "at-vie-1": { baseIntensity: 140, solarDip: 0.35, windVolatility: 0.3 },
+  "at-vie-2": { baseIntensity: 150, solarDip: 0.35, windVolatility: 0.3 },
+  "bg-sof-1": { baseIntensity: 420, solarDip: 0.3, windVolatility: 0.2 },
+  "ch-dk-2": { baseIntensity: 55, solarDip: 0.2, windVolatility: 0.15 },
+  "ch-gva-2": { baseIntensity: 45, solarDip: 0.15, windVolatility: 0.15 },
+  "de-fra-1": { baseIntensity: 380, solarDip: 0.45, windVolatility: 0.45 },
+  "de-muc-1": { baseIntensity: 360, solarDip: 0.5, windVolatility: 0.4 },
+  "hr-zag-1": { baseIntensity: 210, solarDip: 0.3, windVolatility: 0.3 },
+  "es-mad-1": { baseIntensity: 160, solarDip: 0.55, windVolatility: 0.4 },
+  "it-mil-1": { baseIntensity: 300, solarDip: 0.4, windVolatility: 0.25 },
+  "fr-par-1": { baseIntensity: 60, solarDip: 0.1, windVolatility: 0.2 },
+};
+const DEFAULT_CARBON = { baseIntensity: 300, solarDip: 0.3, windVolatility: 0.3 };
 
-export const WORKLOADS: Workload[] = [
-  { id: "wl-01", name: "Climate model ensemble", realId: "w-01-dach-research", kind: "cpu", release: 0, deadline: 96, work: 160, setupH: 1, outputH: 1, countries: DACH, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.9, checkpointH: null, refEnergyKWh: 26.4, note: "Restart-sensitive scientific model, DACH only" },
-  { id: "wl-02", name: "Swiss regulatory report", realId: "w-02-ch-reporting", kind: "cpu", release: 12, deadline: 48, work: 24, setupH: 0.5, outputH: 0.5, countries: ["CH"], minGpuMemGB: 0, maxWorkers: 2, parallelEff: 0.85, checkpointH: 2, refEnergyKWh: 25.344 },
-  { id: "wl-03", name: "Large-input analytics", realId: "w-03-med-analysis", kind: "cpu", release: 0, deadline: 72, work: 120, setupH: 2, outputH: 1, countries: EU_COUNTRIES, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.8, checkpointH: 4, refEnergyKWh: 27.456, note: "Two-hour data staging setup" },
-  { id: "wl-04", name: "LLM fine-tune (EU, 48 GB)", realId: "w-04-dach-batch", kind: "gpu", release: 6, deadline: 84, work: 280, setupH: 1, outputH: 0.5, countries: ["DE", "AT", "FR"], minGpuMemGB: 48, maxWorkers: 4, parallelEff: 0.85, checkpointH: 1, refEnergyKWh: 26.928 },
-  { id: "wl-05", name: "Image embedding batch", realId: "w-05-eu-render", kind: "gpu", release: 0, deadline: 40, work: 90, setupH: 0.5, outputH: 0.5, countries: ALL, minGpuMemGB: 16, maxWorkers: 3, parallelEff: 0.95, checkpointH: 1, refEnergyKWh: 23.232 },
-  { id: "wl-06", name: "Genome alignment", realId: "w-06-large-etl", kind: "cpu", release: 24, deadline: 110, work: 140, setupH: 1, outputH: 1, countries: ALL, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.9, checkpointH: 3, refEnergyKWh: 24.816 },
-  { id: "wl-07", name: "Grid load forecast retrain", realId: "w-07-eu-training", kind: "gpu", release: 30, deadline: 70, work: 120, setupH: 0.5, outputH: 0.5, countries: DACH, minGpuMemGB: 24, maxWorkers: 2, parallelEff: 0.9, checkpointH: 1, refEnergyKWh: 21.12 },
-  { id: "wl-08", name: "Video transcode archive", realId: "w-08-ch-imaging", kind: "cpu", release: 0, deadline: 120, work: 200, setupH: 0.5, outputH: 1, countries: ALL, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.97, checkpointH: 1, refEnergyKWh: 9.24 },
-  { id: "wl-09", name: "Fraud model scoring (EU)", realId: "w-09-eu-large-model", kind: "cpu", release: 36, deadline: 60, work: 40, setupH: 0.5, outputH: 0.5, countries: EU_COUNTRIES, minGpuMemGB: 0, maxWorkers: 3, parallelEff: 0.9, checkpointH: 1, refEnergyKWh: 28.38 },
-  { id: "wl-10", name: "Diffusion training (96 GB)", realId: "w-10-eu-visual", kind: "gpu", release: 12, deadline: 108, work: 420, setupH: 1.5, outputH: 1, countries: ["DE", "AT", "CH", "PL"], minGpuMemGB: 96, maxWorkers: 4, parallelEff: 0.85, checkpointH: 2, refEnergyKWh: 10.488 },
-  { id: "wl-11", name: "Search index rebuild", realId: "w-11-dach-simulation", kind: "cpu", release: 48, deadline: 96, work: 64, setupH: 1, outputH: 0.5, countries: ALL, minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.85, checkpointH: 2, refEnergyKWh: 24.816 },
-  { id: "wl-12", name: "Speech-to-text backlog", realId: "w-12-late-delivery", kind: "gpu", release: 20, deadline: 100, work: 150, setupH: 0.5, outputH: 0.5, countries: ALL, minGpuMemGB: 24, maxWorkers: 3, parallelEff: 0.95, checkpointH: 1, refEnergyKWh: 20.064 },
-  { id: "wl-13", name: "Monte Carlo risk (CH)", realId: "w-13-regional-index", kind: "cpu", release: 60, deadline: 110, work: 80, setupH: 0.5, outputH: 0.5, countries: ["CH"], minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.95, checkpointH: 1, refEnergyKWh: 24.288 },
-  { id: "wl-14", name: "CFD turbine sweep", realId: "w-14-bulk-render", kind: "cpu", release: 8, deadline: 90, work: 180, setupH: 1, outputH: 1, countries: ["DE", "AT", "SE", "FR"], minGpuMemGB: 0, maxWorkers: 4, parallelEff: 0.85, checkpointH: null, refEnergyKWh: 24.816, note: "No checkpoints: any move restarts from zero" },
-  { id: "wl-15", name: "Vision QA eval suite", realId: "w-15-heavy-archive", kind: "gpu", release: 72, deadline: 118, work: 60, setupH: 0.5, outputH: 0.5, countries: EU_COUNTRIES, minGpuMemGB: 24, maxWorkers: 2, parallelEff: 0.9, checkpointH: 1, refEnergyKWh: 24.288 },
-];
+/** Hour 0 of the simulation: midnight UTC on the first release day. */
+export const SCENARIO_START = Date.UTC(2025, 8, 30);
+const hourOf = (iso: string) => (Date.parse(iso) - SCENARIO_START) / 3_600_000;
 
-export const HORIZON_H = 120;
-export const BOOT_H = 0.25;
+export const ZONES: Zone[] = catalog.zones.map((z) => ({
+  id: z.slug,
+  name: z.name,
+  country: z.country,
+  eu: Boolean(z.eu_member),
+  fictional: Boolean(z.fictional),
+  pue: Number(z.pue),
+  ...(CARBON_MODEL[z.slug] ?? DEFAULT_CARBON),
+}));
+
+type RawProfile = (typeof catalog.profiles)[number] & { gpu_memory_gib?: number };
+export const PROFILES: Profile[] = (catalog.profiles as RawProfile[]).map((p) => ({
+  id: p.id,
+  label: `${p.family}.${p.size}`,
+  kind: p.family === "cpu" ? "cpu" : "gpu",
+  family: p.family,
+  vcpu: Number(p.cpu_cores),
+  gpus: Number(p.gpu_count ?? 0),
+  gpuMemGB: Number(p.gpu_memory_gib ?? 0),
+  kw: Number(p.active_watts) / 1000,
+  idleKw: Number(p.idle_watts) / 1000,
+  // vcpu_hour throughput is per hour; tflop throughput is per second
+  throughput: p.work_unit === "tflop" ? Number(p.throughput) * 3600 : Number(p.throughput),
+  unit: p.work_unit,
+  bootH: Number(p.boot_seconds ?? 120) / 3600,
+  zones: p.zones,
+}));
+
+export const QUOTA = {
+  vms: Number(catalog.max_vms),
+  vcpu: Number(catalog.max_vcpus),
+  gpus: catalog.gpu_family_quotas as Record<GpuFamily, number>,
+};
+
+const REF_ENERGY = rules.rules.reference_energy_kwh as Record<string, string>;
+
+type RawWorkload = (typeof catalog.workloads)[number] & {
+  allowed_countries?: string[];
+  forbidden_countries?: string[];
+  allowed_profile_ids?: string[];
+  allowed_families?: string[];
+  minimum_gpu_memory_gib?: number;
+};
+export const WORKLOADS: Workload[] = (catalog.workloads as RawWorkload[]).map((w) => ({
+  id: w.id,
+  name: w.title,
+  kind: w.kind === "gpu" ? "gpu" : "cpu",
+  release: hourOf(w.release_at),
+  deadline: hourOf(w.deadline_at),
+  work: Number(w.required_work),
+  unit: w.work_unit,
+  setupH: Number(w.input_seconds ?? 0) / 3600,
+  outputH: Number(w.output_seconds ?? 0) / 3600,
+  residency: String(w.residency ?? "ANYWHERE").toUpperCase(),
+  allowed: w.allowed_countries ?? null,
+  forbidden: w.forbidden_countries ?? [],
+  profileIds: w.allowed_profile_ids ?? null,
+  families: w.allowed_families ?? null,
+  minVram: Number(w.minimum_gpu_memory_gib ?? 0),
+  maxWorkers: Number(w.max_workers ?? 1),
+  parallelEff: Math.max(0.05, 1 - Number(w.sync_overhead ?? 0)),
+  checkpointH: w.restart_from_zero ? null : Number(w.checkpoint_seconds ?? 0) / 3600 || null,
+  refEnergyKWh: Number(REF_ENERGY[w.id] ?? 0),
+}));
+
+export const HORIZON_H = Math.ceil(Math.max(...WORKLOADS.map((w) => w.deadline)));
 export const DT = 0.25;
 
-export const zoneById = (id: string) => ZONES.find((z) => z.id === id)!;
-export const profileById = (id: string) => PROFILES.find((p) => p.id === id)!;
+const zoneMap = new Map(ZONES.map((z) => [z.id, z]));
+const profileMap = new Map(PROFILES.map((p) => [p.id, p]));
+export const zoneById = (id: string) => zoneMap.get(id)!;
+export const profileById = (id: string) => profileMap.get(id)!;
+export const profileByLabel = (label: string) => PROFILES.find((p) => p.label === label);
 
+const legalityProfile = (p: Profile) => ({ id: p.id, family: p.family, unit: p.unit, vram: p.gpuMemGB });
+
+/** Residency check (disqualifying). Unknown zones are illegal. */
 export function isLegal(w: Workload, zoneId: string) {
-  return w.countries.includes(zoneById(zoneId).country);
+  const z = zoneMap.get(zoneId);
+  return Boolean(z) && zoneLegal(w, z);
 }
 export function legalZones(w: Workload) {
-  return ZONES.filter((z) => w.countries.includes(z.country));
+  return ZONES.filter((z) => zoneLegal(w, z));
+}
+/** Profile offered in the zone and acceptable for the workload (non-disqualifying). */
+export function profileFits(w: Workload, profileId: string, zoneId: string) {
+  const p = profileMap.get(profileId);
+  return Boolean(p) && p!.zones.includes(zoneId) && profileLegal(w, legalityProfile(p!));
 }
 export function feasibleProfiles(w: Workload, zone: Zone) {
-  return PROFILES.filter((p) =>
-    w.kind === "cpu"
-      ? p.kind === "cpu"
-      : p.kind === "gpu" && p.gpuMemGB >= w.minGpuMemGB && zone.gpuFamilies.includes(p.family!),
-  );
+  return PROFILES.filter((p) => profileFits(w, p.id, zone.id));
+}
+/** Short human description of where a workload may run. */
+export function residencyLabel(w: Workload) {
+  const parts = [w.residency === "ANYWHERE" ? "any" : w.residency];
+  if (w.allowed?.length) parts.push(`only ${w.allowed.join(" ")}`);
+  if (w.forbidden.length) parts.push(`not ${w.forbidden.join(" ")}`);
+  return parts.join(" · ");
 }

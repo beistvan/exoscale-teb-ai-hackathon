@@ -6,7 +6,7 @@ STARTER_IMAGE ?= ghcr.io/exogmi/greenops-challenge-starter-kit:latest
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build run stop logs ps shell clean rebuild creds status starter demo dashboard
+.PHONY: help build run stop logs ps shell clean rebuild creds status starter demo dashboard attempt attempt-dry mock cleanup-run
 
 help:
 	@echo "GreenOps webapp in Docker (deps live inside the image, host needs nothing):"
@@ -26,6 +26,7 @@ help:
 	@echo "  make demo      run the official 2-workload demo — STARTS THE CLOCK (use a fresh run)"
 	@echo "  make attempt   run the 15-workload carbon-aware orchestrator (starts the clock)"
 	@echo "  make attempt-dry  plan-only preview against the current .env run (safe, no writes)"
+	@echo "  make mock      offline mock run of the live controller (no credentials, no API)"
 	@echo "  make cleanup-run  delete this controller's VMs via the receipt (after a run)"
 	@echo "  make dashboard print the monitor + challenge dashboard URLs"
 
@@ -88,6 +89,9 @@ attempt: .env
 attempt-dry: .env
 	docker run --rm -t -v "$(CURDIR):/app" -w /app --env-file .env \
 		$(IMAGE) bun scripts/orchestrator.mjs --dry
+
+mock:
+	docker run --rm -t -v "$(CURDIR):/app" -w /app $(IMAGE) bun scripts/greenops/mock.mjs 20 --lat 3000
 
 probe-score: .env
 	@test -f .env || { echo ".env missing — copy credentials first"; exit 1; }
