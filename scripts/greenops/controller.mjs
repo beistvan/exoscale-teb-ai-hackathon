@@ -219,6 +219,14 @@ export class Controller {
     v.memo = this.memo;
     const hourStart = this.cat.T0 + Math.floor(tAct) * H;
     const nowHour = Math.floor(tAct);
+    // this run's observed hourly values for an area (most recent 72), for the placement's window model
+    const distCache = new Map();
+    v.dist = (area) => {
+      if (distCache.has(area)) return distCache.get(area);
+      const m = this.obs.get(area), sh = this.shiftH() * H;
+      const d = m ? [...m.entries()].filter(([t]) => t - sh < hourStart).sort((a, b) => a[0] - b[0]).slice(-72).map(([, x]) => x) : [];
+      distCache.set(area, d); return d;
+    };
     v.fc = (area) => {
       const c = this.fc.get(area);
       if (!c) return null;

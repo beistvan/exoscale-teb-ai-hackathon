@@ -4,7 +4,7 @@ Team **zero-reference** · Exoscale GreenOps Challenge, The Energy Bridge Critic
 
 An autonomous controller that completes the challenge's 15 CPU/GPU workloads on the simulated European cloud with as little electricity CO₂ as possible, without missing a deadline or breaking a residency rule. It decides **where** each workload runs (zone, machine, number of workers), **when** it runs or pauses, and **when** its VMs are deleted. It uses only the public catalog and the controlled run's own status, forecasts and published grid observations.
 
-**Best practice run:** `d84022b1` — **22 079.8 points**, 13.03 kg CO₂e electricity, 15/15 delivered on time, 1st on the practice leaderboard.
+**Best practice runs:** `d84022b1` — **22 079.8 points**, 13.03 kg CO₂e electricity, 15/15 delivered on time; with the default settings. `f3f0384c` (22 080.8) made the same placements with one research option on.
 
 Challenge rules and API: [greenops-challenge-starter-kit](https://github.com/exogmi/greenops-challenge-starter-kit) (`docs/RULES.md`, `docs/API.md`).
 
@@ -59,6 +59,7 @@ Practice runs (15/15 delivered on time, 0 API errors each):
 | `10b214d2` | 22 078.9 | 13.04 kg | 360×; the test above + a 9 % GPU early-phase margin (`marginFracGpu: 0.09`). On par with `d84022b1`; off by default |
 | `6e5310e5` | 22 066.6 | 13.12 kg | 720×; `4c6e96e2`'s test + automatic observation alignment (`obsShiftH: "auto"`). It found observations are stamped with their own hour, i.e. the default 0 |
 | `51b1f33d` | 22 068.1 | 13.10 kg | 720×; the same + the 9 % GPU early-phase margin |
+| `f3f0384c` | 22 080.8 | 13.02 kg | 720×; `d84022b1` + `windowDist`: for short jobs in long windows, the hours beyond the forecast are modelled with this run's observed hours. Germany still didn't look better for w-10, so placements matched `d84022b1` (every job within 0.1 %). Off by default |
 
 The four test runs (`4c6e96e2` … `51b1f33d`) all used the current-hour observation from t=0. All four made the Swiss jobs cleaner (w-04: 0.256 → 0.248 kg) and the GPU jobs dirtier (w-09: 4.012 → 4.02–4.07 kg). Pausing the Swiss jobs more precisely made them hold quota longer, which squeezed the other jobs. `d84022b1`'s settings stay the default.
 
@@ -74,6 +75,7 @@ Oracle ceilings, measured in the mock with forecast misses calibrated to live su
 - a perfect 24 h forecast: +45 pts; a perfect 72 h forecast: +84 pts. Not reachable: forecasts stop at 24 h, and the forecast correction already uses what the observations reveal.
 - 25 % / 50 % more vCPU quota: +29 / +62 pts (unlimited: +114). A smarter allocation can only recover part of this. During the busy middle of run `d84022b1`, 35 % of the held quota sat in stopped VMs, mostly while every job paused in the same dirty hours.
 - one perfect-hindsight zone move per job (migration): −0.4 % (w-09) to −1.4 % (w-06) carbon, so not worth the risk.
+- modelling the window beyond the forecast with observed hours (`windowDist`): +9 pts with random-walk day levels, −11 to −21 pts when each zone's day level reverts to its mean with its own volatility (`MOCK_DRIFT`).
 - forcing two GPUs on w-09 / w-07: −10.6 / −42 pts.
 
 Pre-staging cost 11–53 pts at 3–10 s API lag, so it only runs at low lag. Quota contention is the largest remaining loss in the mock (≈ 127 pts versus unlimited quota).
@@ -123,7 +125,7 @@ The same steps run inside the web-app container via `make mock`, `make attempt-d
 - `MOCK_FC_BIAS=0.3` — biased forecasts;
 - `MOCK_FC_ANOM=0.08,0.8` — persistent forecast misses;
 - `MOCK_HIST_LAG=0` — observation publication lag; `MOCK_HIST_SHIFT=1` — observations stamped one hour late;
-- `MOCK_FC_ANOM_AREA='{"ES":[0.19,0.79],...}'` — per-area forecast-miss size and persistence;
+- `MOCK_FC_ANOM_AREA='{"ES":[0.19,0.79],...}'` — per-area forecast-miss size and persistence; `MOCK_DRIFT='{"DE":[0.3,0.5],...}'` — per-area day-level volatility and persistence;
 - oracles: `MOCK_FC_PERFECT=24` (perfect forecast of that many hours), `MOCK_CORES=400` (another vCPU quota); `--opt forceProfile='{"w-09-eu-large-model":"gpurtx6000pro.medium"}'` pins a machine.
 
 **Web dashboard (optional):** `make run` builds and starts it (default http://localhost:3005/). `/live` polls a run read-only; credentials stay server-side.

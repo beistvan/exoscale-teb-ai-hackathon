@@ -26,6 +26,7 @@ const STAGING_IDLE = process.env.MOCK_STAGING === "idle"; // power model variant
 // t=0 for a t=4 job was computing at t=4.0); compute waits for release. MOCK_PRESTAGE=0 disables.
 const PRESTAGE = process.env.MOCK_PRESTAGE !== "0";
 const HIST_LAG = Number(process.env.MOCK_HIST_LAG ?? 2), HIST_SHIFT = Number(process.env.MOCK_HIST_SHIFT ?? 0);
+const DRIFT = process.env.MOCK_DRIFT ? JSON.parse(process.env.MOCK_DRIFT) : {};
 
 function rng(seed) { let s = (seed >>> 0) || 1; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 2 ** 32; }; }
 function gauss(r) { return Math.sqrt(-2 * Math.log(r() + 1e-12)) * Math.cos(2 * Math.PI * r()); }
@@ -41,7 +42,10 @@ export function makeGrid(seed, hours = 160) {
     let drift = 1;
     const arr = [];
     for (let h = 0; h < hours; h++) {
-      if (h % 24 === 0) drift = Math.max(0.6, Math.min(1.5, drift * (1 + 0.18 * gauss(r))));
+      // MOCK_DRIFT='{"DE":[sigma,rho],...}': day-to-day level as a mean-reverting AR(1) with per-area
+      // volatility (default: the random walk below) — e.g. a wind-driven grid swings more than a hydro one
+      if (h % 24 === 0) drift = DRIFT[a] ? Math.max(0.3, Math.min(2.0, 1 + DRIFT[a][1] * (drift - 1) + DRIFT[a][0] * gauss(r)))
+        : Math.max(0.6, Math.min(1.5, drift * (1 + 0.18 * gauss(r))));
       arr.push(Math.max(5, m * drift * (1 + amp * Math.cos((2 * Math.PI * (h - pk)) / 24)) * (1 + 0.05 * gauss(r))));
     }
     actual[a] = arr;

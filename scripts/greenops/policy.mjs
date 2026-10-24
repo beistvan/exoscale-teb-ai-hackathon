@@ -52,6 +52,9 @@ export const DEFAULTS = {
   marginCpuOnly: true, // the cut applies to CPU jobs only; GPU jobs keep the full margin
   marginFracGpu: null, // GPU jobs' runtime-proportional margin (null: marginFrac)
   prestageNoDefer: false, // with prestage: stage a job before its release even if the current hour looks dirty
+  windowDist: false,   // placement: model the window beyond the forecast with this run's observed hours (see scorePlacement)
+  windowDistMinH: 12,  // ...once at least this many observed hours exist for the area
+  windowDistMaxDuty: 0.4, // ...only for placements needing at most this share of their window (short jobs, long windows)
   pauseOutput: false,  // allow pausing during the final output phase (it otherwise always runs)
   llf: false,          // reserve queued jobs least-laxity-first (due - need) instead of earliest-due-first
   gpuTightW: 0,        // GPU placements needing more than gpuTightAt of their window are penalised by this per unit
@@ -129,7 +132,18 @@ export function scorePlacement(cat, w, c, rem, tH, fcFor, o, calib = 1) {
   const fc = fcFor(c.zone.area);
   if (!fc?.length) return null;
   const W = Math.max(1, Math.min(fc.length, Math.floor(availH)));
-  const expI = cheapestMean(fc.slice(0, W), (W * needH) / availH);
+  let expI = cheapestMean(fc.slice(0, W), (W * needH) / availH);
+  // windowDist: hours of the window beyond the forecast are drawn from this run's observed hours plus the
+  // forecast (quantiles), instead of assuming they look like the next 24 h — a zone whose recent days had
+  // very clean stretches (e.g. a windy grid) gets credit for them, mostly for short jobs in long windows
+  if (o.windowDist && o.distFor && availH > fc.length + 1 && needH / availH <= o.windowDistMaxDuty) {
+    const hist = o.distFor(c.zone.area) ?? [];
+    if (hist.length >= o.windowDistMinH) {
+      const S = [...hist, ...fc].sort((a, b) => a - b), U = Math.round(availH - fc.length);
+      const pseudo = Array.from({ length: U }, (_, i) => S[Math.min(S.length - 1, Math.floor(((i + 0.5) / U) * S.length))]);
+      expI = cheapestMean([...fc, ...pseudo], needH);
+    }
+  }
   const kwh = (c.k * c.prof.watts * needH) / 1000;
   return { ...c, needH, availH, hardH, slackH: hardH - needH, expI, kwh, grams: kwh * c.zone.pue * expI };
 }
@@ -254,6 +268,7 @@ export function decide(cat, view, opts = {}) {
   if (o0.latH <= o0.lowLatH && o.marginCutH > 0) { o.marginMinHGpu = o0.marginMinH; o.marginMinH = Math.max(o.lowLatMarginMinH, o0.marginMinH - o.marginCutH); }
   HP = Number(o.horizonPenalty) || 0;
   LLF = Boolean(o.llf);
+  o.distFor = view.dist;
   const acts = [];
   const tH = view.t;
   const relH = (j) => (j.w.release - cat.T0) / H;
