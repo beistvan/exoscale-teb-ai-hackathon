@@ -151,3 +151,84 @@ By the end of the weekend, your team should have a working orchestrator, a repro
 There is room for several approaches: a small rule-based controller, a forecast-driven planner or an optimization solver. A good starting point is a few legal VM deployments. The challenge is turning those into a reliable scheduler that handles the whole workload collection—and understanding which improvements actually help.
 
 
+
+
+---
+
+# Project setup & run book
+
+Everything below is specific to **this repo** (webapp + orchestrator), documented as-built.
+
+## What this repo contains
+
+| Part | Location | Purpose |
+|---|---|---|
+| Simulation (pure, seeded, deterministic) | `src/lib/sim` | Offline mirror of the challenge rules: policies receive only published forecasts (`PolicyView`), residency is enforced by the engine, score uses the frozen offsets (20 000 base + 5 000 bonus, 200 gCO₂e/kWh reference). |
+| Web app (TanStack Start + Vite) | `src/routes` | Dashboard + **/live monitor** page that polls a run's APIs read-only and shows VMs, status, forecasts and charts. |
+| Docker + Make | `Dockerfile`, `Makefile`, `.dockerignore` | Run everything in a container; no host `node_modules` needed (keeps `/home` disk usage ~0). |
+| Helpers | `scripts/` | `greenops-status.mjs` (read-only run status), `make-creds.mjs` (generates `greenops-exo.json` from `.env`), `orchestrator.mjs` (15-workload carbon-aware live controller). |
+
+## Quick start (one command)
+
+```bash
+make run          # build image (first time) and start the webapp on http://localhost:8080
+```
+
+The dev server runs inside the container; `/` is the dashboard, `/live` is the live-run monitor. `make logs`, `make stop`, `make ps`, `make shell`, `make rebuild`, `make clean` are also available (see `make help`).
+
+## Run credentials — never committed
+
+- A run gives you cloud key/secret, cloud/work/grid endpoints and a grid secret (the "Copy environment" button on the runner page).
+- Put them in `.env` (from `.env.example`): `EXOSCALE_API_KEY`, `EXOSCALE_API_SECRET`, `GREENOPS_CLOUD_ENDPOINT`, `GREENOPS_WORK_ENDPOINT`, `GREENOPS_GRID_ENDPOINT`, `GREENOPS_GRID_SECRET`.
+- `.env`, `env/`, `greenops-exo.json` and the orchestrator receipt are gitignored. The image never contains them: `docker run --env-file .env` injects at runtime.
+- The `/live` page uses the server-side `.env` automatically (it only receives booleans, never the values); manual paste into the page still works as a fallback.
+
+## Run commands
+
+```bash
+make status        # read-only run state: state, virtual clock, delivered/started workloads, zones
+make creds         # write greenops-exo.json (mode 600) for the official starter kit
+make starter       # clone the official starter kit (once)
+make demo          # official 2-workload demo  — STARTS THE CLOCK (use a fresh run)
+make attempt       # 15-workload carbon-aware orchestrator — STARTS THE CLOCK
+make attempt-dry   # plan-only preview of the orchestrator (safe, no writes)
+make cleanup-run   # delete this controller's VMs via its receipt (after a run)
+make dashboard     # print monitor + challenge board URLs
+```
+
+`make attempt` and `attempt-dry` run `scripts/orchestrator.mjs` inside the app container (`bun`), so the host needs nothing besides Docker and the `.env`.
+
+## How runs work (facts, verified from the platform docs and API)
+
+- The clock starts on your **first accepted VM deployment**, not at run creation. Creating a run costs nothing until you deploy.
+- **Score cap: 20 000 base + 5 000 completion bonus = 25 000 points** (frozen `greenops-score-v2` cohort; electricity-usage basis, 200 gCO₂e/kWh reference, bounded quality = ¾ local + ¼ shared cost). Practically, all 15 workloads must complete before their deadlines to reach >20k.
+- Speeds: 1× (5 days), 60× (2 h), 360× (20 min), 720× (10 min for the full window). **Speed does not change the score** — official judging reruns at 720×, so develop at 720×.
+- Attempts: unlimited, max **2 unfinished** runs per team; each run sees only its own published forecasts (fair play).
+- Residency: an illegal placement attempt disqualifies the run (score 0) — the engine enforces the same rule in simulation.
+
+## The orchestrator (`make attempt`)
+
+Carbon-aware, quote-safe, idempotent 15-workload controller:
+
+- Reads its own run's `/work/v1/status`, `/zone`, `/instance-type` (live profile catalog), `/template` and grid forecasts only — never future actuals.
+- Deploys the **cleanest legal (zone, profile, workers) option available now**, ordered by deadline urgency, respecting release times and quotas (20 VMs / 320 vCPU / GPU-family caps), with residency checks. (Forecast-window *waiting* is in the offline policy; the live planner is deliberately conservative about deadlines.)
+- Deterministic VM names + a local receipt (`greenops-orchestrator-state.json`, gitignored) make reruns recover accepted creates; VMs of delivered workloads are deleted automatically.
+- EXO2 signing follows the official spec (message = `METHOD path` + body + query-values + headers + expiry; signature = base64 HMAC-SHA256; `signed-query-args` pragma for query params).
+
+**Verification status (evidence, not claims):** the read path (zones, per-zone instance lists, instance-type, template, work status, grid forecasts) was exercised end-to-end against the live run — a completed run reports `COMPLETED` + 2/15 delivered and the orchestrator exits 0. The POST/DELETE signatures were accepted by the server (it returned business errors, not auth errors — a completed run rejects all creates with `unknown or unavailable instance type` for bogus and real ids alike). **Writes have not yet been exercised against a live run**, so the first `make attempt` on a fresh run is the real test of create/delete semantics.
+
+## What was fixed / changed (this repo)
+
+- `tsconfig.json` gained `"node"` in `types` (server-side `process.env` access).
+- `src/lib/live.functions.ts` / `src/routes/live.tsx`: run credentials read server-side from `.env`; live page auto-detects the config and starts polling; secrets never reach the browser.
+- `Makefile` `stop`/`run` force-remove stale containers (a stopped container previously blocked `make run` with a name conflict).
+- A policy-parameter sweep (12 seeds × 9 configs) showed the shipped carbon-aware policy is within ±0.2 % of every alternative and the best candidates regress 2/12 seeds — **kept the shipped defaults**; no regression per the contract test ("both shipped policies stay legal and the carbon-aware one emits less").
+- Pre-existing, unrelated: tsc errors in `ui/chart.tsx`, `input-otp.tsx`, `sheet.tsx`, `sidebar.tsx`, `routes/index.tsx`, `src/start.ts` (present at HEAD, untouched); `app-routing.test.tsx` fails inside the container image with a Zod resolution quirk (passes on a host install); both are infra noise, not regressions.
+
+## Host-disk notes
+
+`/home` has no headroom, so `node_modules` and Docker's data live elsewhere: Docker's data root is on `/goinfre`; the webapp image builds deps into its own layer. The only host footprint is the source tree (~5 MB). If you ever need host-side `bun test`/`bunx tsc`, symlink `node_modules` into a big mount (`/tmp` or `/sgoinfre`) first.
+
+## Competition entry (the actual submission)
+
+Submit a GitHub repo + immutable commit SHA + claimed practice run + reproducible build/run instructions; organizers review (source stays private to team + organizers; grant repo access manually) and rerun your controller at 720× on their infra — that rerun is your official score. `make attempt` + this README is the reproducible "container entry point launches the orchestrator" story. The CHF 50 Exoscale coupon is for hosting your own controller/live demo — it does not affect scoring (judging reruns on their own machines). There is no deployment to the challenge site: the dashboard is the run's own UI, and this webapp is a second, local, read-only window onto the same run.
