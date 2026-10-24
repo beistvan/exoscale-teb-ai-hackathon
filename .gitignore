@@ -39,3 +39,4 @@ greenops-exo.json
 *.credentials.json
 env/
 greenops-challenge-starter-kit/
+greenops-orchestrator-state.json

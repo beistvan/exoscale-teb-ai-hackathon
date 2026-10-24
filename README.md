@@ -171,7 +171,7 @@ Everything below is specific to **this repo** (webapp + orchestrator), documente
 ## Quick start (one command)
 
 ```bash
-make run          # build image (first time) and start the webapp on http://localhost:8080
+make run          # build image (first time) and start the webapp; prints the real URL (default http://localhost:8080, or another free port)
 ```
 
 The dev server runs inside the container; `/` is the dashboard, `/live` is the live-run monitor. `make logs`, `make stop`, `make ps`, `make shell`, `make rebuild`, `make clean` are also available (see `make help`).

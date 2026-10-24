@@ -1,6 +1,6 @@
 IMAGE ?= greenops-webapp
 CONTAINER ?= greenops-webapp
-PORT ?= 8080
+PORT ?= 3005
 STARTER ?= greenops-challenge-starter-kit
 STARTER_IMAGE ?= ghcr.io/exogmi/greenops-challenge-starter-kit:latest
 
@@ -35,12 +35,19 @@ build:
 .env:
 	test -f .env || cp .env.example .env
 
+# print the host port the greenops-webapp container actually publishes (container:8080 -> host:PORT)
+realport = $(shell docker port $(CONTAINER) 8080/tcp 2>/dev/null | head -1 | sed 's/.*:\([0-9][0-9]*\).*/\1/')
+
 run: build .env
 	@if docker ps -q --filter name=^$(CONTAINER)$$ | grep -q .; then \
-		echo "$(CONTAINER) already running — make stop first"; \
+		echo "$(CONTAINER) already running — URL: http://localhost:$(or $(realport),$(PORT))/"; \
 	else \
 		docker rm -f $(CONTAINER) 2>/dev/null || true; \
-		docker run -d --name $(CONTAINER) -p $(PORT):8080 --env-file .env $(IMAGE); \
+		HPORT=$$(p=$(PORT); while :; do \
+			if docker ps -a --format '{{.Ports}}' | grep -q "0\.0\.0\.0:$$p->" || ss -ltn 2>/dev/null | grep -q ":$$p "; then p=$$((p+1)); else break; fi; done; echo $$p); \
+		docker run -d --name $(CONTAINER) -p $$HPORT:8080 --env-file .env $(IMAGE); \
+		if [ "$$HPORT" != "$(PORT)" ]; then echo "$(PORT) busy — "; fi; \
+		echo "$(CONTAINER) started — URL: http://localhost:$$HPORT/"; \
 	fi
 
 stop:
@@ -75,12 +82,22 @@ demo: starter
 
 attempt: .env
 	@test -f .env || { echo ".env missing — copy credentials first"; exit 1; }
-	docker run --rm -v "$(CURDIR):/app" -w /app --env-file .env \
+	docker run --rm -t -v "$(CURDIR):/app" -w /app --env-file .env \
 		$(IMAGE) bun scripts/orchestrator.mjs
 
 attempt-dry: .env
-	docker run --rm -v "$(CURDIR):/app" -w /app --env-file .env \
+	docker run --rm -t -v "$(CURDIR):/app" -w /app --env-file .env \
 		$(IMAGE) bun scripts/orchestrator.mjs --dry
+
+probe-score: .env
+	@test -f .env || { echo ".env missing — copy credentials first"; exit 1; }
+	docker run --rm -t -v "$(CURDIR):/app" -w /app --env-file .env \
+		$(IMAGE) bun scripts/probe-score.mjs
+
+probe-timeline: .env
+	@test -f .env || { echo ".env missing — copy credentials first"; exit 1; }
+	docker run --rm -t -v "$(CURDIR):/app" -w /app --env-file .env \
+		$(IMAGE) bun scripts/probe-timeline.mjs
 
 cleanup-run: .env
 	@test -f greenops-orchestrator-state.json || { echo "no receipt — nothing to clean"; exit 1; }
@@ -88,7 +105,7 @@ cleanup-run: .env
 		$(IMAGE) bun scripts/orchestrator.mjs destroy
 
 dashboard:
-	@echo "Monitor:          http://localhost:$(PORT)"
+	@echo "Monitor:          http://localhost:$(or $(realport),$(PORT))/"
 	@echo "Challenge board:  https://greenops.containerstack.net/app/runs"
 
 clean:
