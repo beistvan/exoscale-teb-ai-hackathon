@@ -42,25 +42,29 @@ function run(cfg, extra) {
   return r.stdout.trim().split("\n").map((l) => JSON.parse(l));
 }
 const stats = (b, v) => {
-  const d = v.map((x, i) => x.points - b[i].points), n = d.length;
+  const failed = (x) => x.late.length || x.dq;
+  const all = v.map((x, i) => x.points - b[i].points);
+  // clean: seeds where neither side failed (one missed deadline costs >5000 pts and swamps the mean)
+  const d = v.map((x, i) => [x, b[i]]).filter(([x, y]) => !failed(x) && !failed(y)).map(([x, y]) => x.points - y.points), n = d.length;
+  const mAll = all.reduce((s, x) => s + x, 0) / all.length;
   const m = d.reduce((s, x) => s + x, 0) / n;
   const se = Math.sqrt(d.reduce((s, x) => s + (x - m) ** 2, 0) / (n - 1) / n);
   const fails = (r) => r.filter((x) => x.late.length || x.dq).length;
   const kg = (r) => r.reduce((s, x) => s + x.grams, 0) / r.length / 1000;
-  return { m, se, t: m / se, up: d.filter((x) => x > 1e-9).length, down: d.filter((x) => x < -1e-9).length, n,
+  return { m, se, t: m / se, mAll, failSeedsB: b.filter(failed).map((x) => `${x.seed}:${x.late.join("+") || "DQ"}`), failSeedsV: v.filter(failed).map((x) => `${x.seed}:${x.late.join("+") || "DQ"}`), up: d.filter((x) => x > 1e-9).length, down: d.filter((x) => x < -1e-9).length, n,
     baseMean: b.reduce((s, x) => s + x.points, 0) / n, kgDiff: kg(v) - kg(b), failB: fails(b), failV: fails(v) };
 };
 
 const t0 = Date.now();
 const base = Object.fromEntries(CFG.map((c) => [c, run(c, [])]));
 console.log(`baseline${BASE.length ? " [" + BASE.join(" ") + "]" : ""}, seeds ${FROM}-${FROM + SEEDS - 1}: ` +
-  CFG.map((c) => { const r = base[c]; return `${c} ${(r.reduce((s, x) => s + x.points, 0) / r.length).toFixed(1)} pts (fail ${r.filter((x) => x.late.length || x.dq).length})`; }).join(" | ") +
+  CFG.map((c) => { const r = base[c], f = r.filter((x) => x.late.length || x.dq); return `${c} ${(r.reduce((s, x) => s + x.points, 0) / r.length).toFixed(1)} pts (fail ${f.length}${f.length ? " " + f.map((x) => `${x.seed}:${x.late.join("+") || "DQ"}`).join(",") : ""})`; }).join(" | ") +
   ` [${((Date.now() - t0) / 1000).toFixed(0)} s]`);
 for (const v of variants) {
   const t1 = Date.now();
   const extra = v.split(" ").filter(Boolean);
   const res = CFG.map((c) => [c, stats(base[c], run(c, extra))]);
-  const line = res.map(([c, s]) => `${c} ${s.m >= 0 ? "+" : ""}${s.m.toFixed(2)} ±${s.se.toFixed(2)} (t ${s.t.toFixed(1)}, ${s.up}↑/${s.down}↓, fail ${s.failB}→${s.failV})`).join(" | ");
+  const line = res.map(([c, s]) => `${c} ${s.m >= 0 ? "+" : ""}${s.m.toFixed(2)} ±${s.se.toFixed(2)} (t ${s.t.toFixed(1)}, ${s.up}↑/${s.down}↓, fail ${s.failB}→${s.failV}${s.failV ? " " + s.failSeedsV.join(",") : ""}; all-seed ${s.mAll >= 0 ? "+" : ""}${s.mAll.toFixed(1)})`).join(" | ");
   console.log(`${v.padEnd(44)} ${line} [${((Date.now() - t1) / 1000).toFixed(0)} s]`);
   if (OUT) fs.appendFileSync(OUT, JSON.stringify({ variant: v, base: BASE.join(" "), seeds: SEEDS, from: FROM, res: Object.fromEntries(res) }) + "\n");
 }
