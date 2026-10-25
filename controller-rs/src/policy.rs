@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use crate::model::{Cand, Catalog, FxMap, H, Usage, candidates, fits_quota, jmax, jmin, marginal_points, output_h, rate_k, setup_h};
+use crate::tweaks::Tweaks;
 
 /// Policy options after the controller's per-step overrides (marginMinH, latH) and the low-lag
 /// overrides. Field names follow DEFAULTS in policy.mjs.
@@ -51,6 +52,8 @@ pub struct Opts {
     pub replace_foreign: bool,
     pub replace_min_rel: f64,
     pub replace_min_g: f64,
+    /// GPU jobs' runtime-proportional margin (None: margin_frac)
+    pub margin_frac_gpu: Option<f64>,
 }
 
 impl Opts {
@@ -58,6 +61,11 @@ impl Opts {
     /// `lowLatH` (0.15 sim hours): `cpuWindowH: 1e9, pressureValuePerCore: 0.08, marginCutH: 3,
     /// prestage: true`, and the deadline-margin cut for CPU jobs (GPU jobs keep the full margin).
     pub fn resolve(margin_min_h: f64, lat_h: f64) -> Opts {
+        Opts::resolve_with(margin_min_h, lat_h, &Tweaks::default())
+    }
+
+    /// `resolve` with named overrides applied (experiments; no overrides = the JS defaults).
+    pub fn resolve_with(margin_min_h: f64, lat_h: f64, tw: &Tweaks) -> Opts {
         let mut o = Opts {
             margin_min_h,
             margin_min_h_gpu: None,
@@ -88,16 +96,55 @@ impl Opts {
             replace_foreign: true,
             replace_min_rel: 0.15,
             replace_min_g: 100.0,
+            margin_frac_gpu: None,
         };
-        const LOW_LAT_H: f64 = 0.15;
-        const MARGIN_CUT_H: f64 = 3.0;
-        const LOW_LAT_MARGIN_MIN_H: f64 = 1.0;
-        if lat_h <= LOW_LAT_H {
-            o.cpu_window_h = 1e9;
-            o.pressure_value_per_core = 0.08;
-            o.prestage = true;
-            o.margin_min_h_gpu = Some(margin_min_h);
-            o.margin_min_h = jmax(LOW_LAT_MARGIN_MIN_H, margin_min_h - MARGIN_CUT_H);
+        if !tw.is_empty() {
+            let b = |v: f64| v != 0.0;
+            for (k, v) in &tw.kv {
+                let v = *v;
+                match k.as_str() {
+                    "margin_frac" => o.margin_frac = v,
+                    "margin_frac_gpu" => o.margin_frac_gpu = Some(v),
+                    "margin_cpu_only" => o.margin_cpu_only = b(v),
+                    "fit_tol" => o.fit_tol = v,
+                    "max_duty" => o.max_duty = v,
+                    "pause_quantum_h" => o.pause_quantum_h = v,
+                    "cpu_window_h" => o.cpu_window_h = v,
+                    "buffer_lat_x" => o.buffer_lat_x = v,
+                    "min_value_per_core" => o.min_value_per_core = v,
+                    "noise_band" => o.noise_band = v,
+                    "prestage" => o.prestage = b(v),
+                    "reserve_single" => o.reserve_single = b(v),
+                    "duty_w" => o.duty_w = v,
+                    "gpu_duty_w" => o.gpu_duty_w = v,
+                    "gpu_duty_max_lat_h" => o.gpu_duty_max_lat_h = v,
+                    "gpu_tight_w" => o.gpu_tight_w = v,
+                    "gpu_tight_at" => o.gpu_tight_at = v,
+                    "scarcity_w" => o.scarcity_w = v,
+                    "card_w" => o.card_w = v,
+                    "sticky_tol" => o.sticky_tol = v,
+                    "cpu_pause_max_lat_h" => o.cpu_pause_max_lat_h = v,
+                    "points_aware" => o.points_aware = b(v),
+                    "pressure_value_per_core" => o.pressure_value_per_core = v,
+                    "queue_cushion_h" => o.queue_cushion_h = v,
+                    "replace_foreign" => o.replace_foreign = b(v),
+                    "replace_min_rel" => o.replace_min_rel = v,
+                    "replace_min_g" => o.replace_min_g = v,
+                    _ => {}
+                }
+            }
+        }
+        let low_lat_h = tw.get("low_lat_h").unwrap_or(0.15);
+        let margin_cut_h = tw.get("low.margin_cut_h").unwrap_or(3.0);
+        let low_lat_margin_min_h = tw.get("low.margin_min_h").unwrap_or(1.0);
+        if lat_h <= low_lat_h {
+            o.cpu_window_h = tw.get("low.cpu_window_h").unwrap_or(1e9);
+            o.pressure_value_per_core = tw.get("low.pressure_value_per_core").unwrap_or(0.08);
+            o.prestage = tw.get("low.prestage").map(|v| v != 0.0).unwrap_or(true);
+            if margin_cut_h > 0.0 {
+                o.margin_min_h_gpu = Some(margin_min_h);
+                o.margin_min_h = jmax(low_lat_margin_min_h, margin_min_h - margin_cut_h);
+            }
         }
         o
     }
@@ -108,7 +155,11 @@ fn margin_h(o: &Opts, need_h: f64, gpu: bool) -> f64 {
         Some(g) if gpu && o.margin_cpu_only => g,
         _ => o.margin_min_h,
     };
-    jmax(base, o.margin_frac * need_h)
+    let frac = match o.margin_frac_gpu {
+        Some(f) if gpu => f,
+        _ => o.margin_frac,
+    };
+    jmax(base, frac * need_h)
 }
 
 /// One VM as the policy sees it (status assignment, or a receipt row not listed yet).
@@ -378,6 +429,8 @@ pub struct Policy {
     wins: Vec<Win>,
     win_ver: Vec<u64>,
     empty: Win,
+    /// experiment overrides (empty: the JS defaults)
+    pub tweaks: Tweaks,
 }
 
 impl Policy {
@@ -393,6 +446,7 @@ impl Policy {
             wins: Vec::new(),
             win_ver: Vec::new(),
             empty: Win::new(&[]),
+            tweaks: Tweaks::default(),
         }
     }
 
@@ -679,7 +733,7 @@ impl Policy {
     /// One decision. `margin_min_h` and `lat_h` are the controller's per-step overrides.
     /// Returns actions in the JS order (deletes, staged stops, pauses/resumes, creates, clock start).
     pub fn decide(&mut self, cat: &Catalog, view: &View, memo: &mut FxMap<String, Memo>, margin_min_h: f64, lat_h: f64) -> Vec<Action> {
-        let o = Opts::resolve(margin_min_h, lat_h);
+        let o = Opts::resolve_with(margin_min_h, lat_h, &self.tweaks);
         if self.wins.len() != view.fc.len() {
             self.wins = view.fc.iter().map(|_| Win::new(&[])).collect();
             self.win_ver = vec![u64::MAX; view.fc.len()];

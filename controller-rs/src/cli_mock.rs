@@ -51,6 +51,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut json = false;
     let mut threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let mut o = SimOpts::default();
+    let (mut popt, mut copt): (Vec<String>, Vec<String>) = (vec![], vec![]);
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -76,6 +77,14 @@ pub fn run(args: &[String]) -> i32 {
                 crate::jsmath::set_fma(next(i) == "1");
                 i += 1;
             }
+            "--opt" => {
+                popt.push(next(i));
+                i += 1;
+            }
+            "--ctl" => {
+                copt.push(next(i));
+                i += 1;
+            }
             "--no-learn-bias" => o.ctl.learn_bias = false,
             "--no-nowcast" => o.ctl.nowcast = false,
             "--foreign" => o.foreign = true,
@@ -84,7 +93,7 @@ pub fn run(args: &[String]) -> i32 {
             _ if a.chars().all(|c| c.is_ascii_digit()) => seeds = a.parse().unwrap(),
             _ => {
                 eprintln!(
-                    "unknown mock option {a}\nusage: mock [seeds=20] [--lat MS=3000] [--from N] [--threads N] [--json] [--fma 0|1] [--foreign] [--late H] [--verbose] [--no-learn-bias] [--no-nowcast]"
+                    "unknown mock option {a}\nusage: mock [seeds=20] [--lat MS=3000] [--from N] [--threads N] [--json] [--fma 0|1] [--foreign] [--late H] [--verbose] [--opt key=value]... [--ctl key=value]..."
                 );
                 return 2;
             }
@@ -92,6 +101,19 @@ pub fn run(args: &[String]) -> i32 {
         i += 1;
     }
     o.lat_ms = lat;
+    match (
+        crate::tweaks::Tweaks::parse(&popt, crate::tweaks::POLICY_KEYS),
+        crate::tweaks::Tweaks::parse(&copt, crate::tweaks::CONTROL_KEYS),
+    ) {
+        (Ok(p), Ok(c)) => {
+            o.policy = p;
+            o.ctl.apply(&c);
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    }
     o.env = match MockEnv::from_env() {
         Ok(e) => e,
         Err(e) => {
@@ -133,10 +155,12 @@ pub fn run(args: &[String]) -> i32 {
         if json {
             let per: serde_json::Map<String, serde_json::Value> =
                 r.per_job.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect();
+            let bper: serde_json::Map<String, serde_json::Value> =
+                r.per_job.iter().zip(&r.bound_per).map(|((k, _), b)| (k.clone(), serde_json::json!(b))).collect();
             println!(
                 "{}",
                 serde_json::json!({ "seed": r.seed, "lat": lat, "points": r.points, "grams": r.grams, "kwh": r.kwh, "idleG": r.idle_g, "late": r.late, "dq": r.dq,
-                    "rejects": r.rejects, "leftVms": r.left_vms, "stats": r.stats, "perJob": per, "ms": ms })
+                    "rejects": r.rejects, "leftVms": r.left_vms, "stats": r.stats, "perJob": per, "bound": r.bound, "boundPer": bper, "ms": ms })
             );
         } else {
             println!(

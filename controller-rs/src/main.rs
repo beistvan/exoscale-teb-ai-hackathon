@@ -24,7 +24,15 @@ fn main() {
             0
         }
         _ => {
-            let mut o = driver::Options { dry: false, destroy: false, state: None, catalog: None };
+            let mut o = driver::Options {
+                dry: false,
+                destroy: false,
+                state: None,
+                catalog: None,
+                policy: Default::default(),
+                ctl: Default::default(),
+            };
+            let (mut popt, mut copt): (Vec<String>, Vec<String>) = (vec![], vec![]);
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -39,12 +47,33 @@ fn main() {
                         o.catalog = args.get(i + 1).cloned();
                         i += 1;
                     }
+                    "--opt" => {
+                        popt.push(args.get(i + 1).cloned().unwrap_or_default());
+                        i += 1;
+                    }
+                    "--ctl" => {
+                        copt.push(args.get(i + 1).cloned().unwrap_or_default());
+                        i += 1;
+                    }
                     other => {
                         eprintln!("unknown argument {other}\n{USAGE}");
                         std::process::exit(2);
                     }
                 }
                 i += 1;
+            }
+            match (
+                greenops_controller::tweaks::Tweaks::parse(&popt, greenops_controller::tweaks::POLICY_KEYS),
+                greenops_controller::tweaks::Tweaks::parse(&copt, greenops_controller::tweaks::CONTROL_KEYS),
+            ) {
+                (Ok(p), Ok(c)) => {
+                    o.policy = p;
+                    o.ctl = c;
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
             }
             if o.dry && o.destroy {
                 eprintln!("--dry and destroy don't mix");

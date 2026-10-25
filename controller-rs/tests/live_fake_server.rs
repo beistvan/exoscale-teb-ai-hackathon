@@ -249,7 +249,15 @@ async fn live_driver_dry_then_full_run_against_a_local_fake_api() {
     }
 
     // 1. --dry: reads only, the clock must not start, nothing is written locally
-    let code = driver::main(driver::Options { dry: true, destroy: false, state: None, catalog: None }).await;
+    let code = driver::main(driver::Options {
+        dry: true,
+        destroy: false,
+        state: None,
+        catalog: None,
+        policy: Default::default(),
+        ctl: Default::default(),
+    })
+    .await;
     assert_eq!(code, 0);
     {
         let f = fake.lock().unwrap();
@@ -262,7 +270,15 @@ async fn live_driver_dry_then_full_run_against_a_local_fake_api() {
 
     // 2. the full run: until every workload is delivered (or the run ends), then every VM deleted
     let t = Instant::now();
-    let code = driver::main(driver::Options { dry: false, destroy: false, state: None, catalog: None }).await;
+    let code = driver::main(driver::Options {
+        dry: false,
+        destroy: false,
+        state: None,
+        catalog: None,
+        policy: Default::default(),
+        ctl: Default::default(),
+    })
+    .await;
     assert_eq!(code, 0);
     let f = fake.lock().unwrap();
     assert!(f.log.bad_auth.is_empty(), "bad signatures: {:?}", f.log.bad_auth);

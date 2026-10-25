@@ -25,6 +25,9 @@ pub struct Options {
     pub destroy: bool,
     pub state: Option<PathBuf>,
     pub catalog: Option<String>,
+    /// experiment overrides (`--opt` / `--ctl`); empty for real runs unless deliberately set
+    pub policy: crate::tweaks::Tweaks,
+    pub ctl: crate::tweaks::Tweaks,
 }
 
 fn now_ms() -> f64 {
@@ -162,6 +165,9 @@ pub async fn main(opts: Options) -> i32 {
     let state_path = opts.state.clone().unwrap_or_else(|| dir.join("greenops-orchestrator-state.json"));
     let mode = if opts.destroy { "destroy" } else { "run" };
     log(&format!("[boot] run={run} mode={mode}{} state={} (rust)", if opts.dry { " (dry)" } else { "" }, state_path.display()));
+    if !opts.policy.is_empty() || !opts.ctl.is_empty() {
+        log(&format!("[boot] overrides policy: {} control: {}", opts.policy.describe(), opts.ctl.describe()));
+    }
     let mut cat = match Catalog::load(opts.catalog.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -180,7 +186,10 @@ pub async fn main(opts: Options) -> i32 {
 
     if opts.dry {
         // one decision with no side effects (fresh receipt, nothing saved)
-        let mut core = Core::new(cat, RunState { run: run.clone(), ..Default::default() }, &run, ControlOpts::default());
+        let mut co = ControlOpts::default();
+        co.apply(&opts.ctl);
+        let mut core = Core::new(cat, RunState { run: run.clone(), ..Default::default() }, &run, co);
+        core.set_policy_tweaks(opts.policy.clone());
         let l = log.clone();
         core.set_log(Box::new(move |m: &str| l(m)));
         let deadline = now_ms() + 90_000.0;
@@ -231,7 +240,10 @@ pub async fn main(opts: Options) -> i32 {
     }
 
     let st = load_state(&state_path, &run, &log);
-    let mut core = Core::new(cat, st, &run, ControlOpts::default());
+    let mut co = ControlOpts::default();
+    co.apply(&opts.ctl);
+    let mut core = Core::new(cat, st, &run, co);
+    core.set_policy_tweaks(opts.policy.clone());
     let l = log.clone();
     core.set_log(Box::new(move |m: &str| l(m)));
     // one JSON object per line: decisions, acknowledgements (with latency + sim hours elapsed), status replies

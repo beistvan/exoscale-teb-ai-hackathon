@@ -49,6 +49,31 @@ pub struct ControlOpts {
     pub nowcast_min_rho: f64,
 }
 
+impl ControlOpts {
+    /// Apply `--ctl key=value` overrides.
+    pub fn apply(&mut self, tw: &crate::tweaks::Tweaks) {
+        for (k, v) in &tw.kv {
+            let v = *v;
+            match k.as_str() {
+                "loop_ms" => self.loop_ms = v,
+                "status_concurrency" => self.status_concurrency = v as u32,
+                "status_gap_ms" => self.status_gap_ms = v,
+                "base_margin_h" => self.base_margin_h = v,
+                "latency_margin_x" => self.latency_margin_x = v,
+                "min_dwell_h" => self.min_dwell_h = v,
+                "max_lat_h" => self.max_lat_h = v,
+                "learn_bias" => self.learn_bias = v != 0.0,
+                "bias_shrink_n" => self.bias_shrink_n = v,
+                "bias_cap" => self.bias_cap = v,
+                "nowcast" => self.nowcast = v != 0.0,
+                "nowcast_min_n" => self.nowcast_min_n = v,
+                "nowcast_min_rho" => self.nowcast_min_rho = v,
+                _ => {}
+            }
+        }
+    }
+}
+
 impl Default for ControlOpts {
     fn default() -> Self {
         ControlOpts {
@@ -412,6 +437,11 @@ impl Core {
             log: None,
             event: None,
         }
+    }
+
+    /// Policy experiment overrides (`--opt`); empty = the JS defaults.
+    pub fn set_policy_tweaks(&mut self, tw: crate::tweaks::Tweaks) {
+        self.policy.tweaks = tw;
     }
 
     pub fn set_log(&mut self, f: LogFn) {

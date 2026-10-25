@@ -643,6 +643,8 @@ impl VClock {
 pub struct SimOpts {
     pub lat_ms: f64,
     pub ctl: ControlOpts,
+    /// policy experiment overrides (empty: the JS defaults)
+    pub policy: crate::tweaks::Tweaks,
     pub late_start_h: f64,
     pub foreign: bool,
     pub verbose: bool,
@@ -651,7 +653,15 @@ pub struct SimOpts {
 
 impl Default for SimOpts {
     fn default() -> Self {
-        SimOpts { lat_ms: 3000.0, ctl: ControlOpts::default(), late_start_h: 0.0, foreign: false, verbose: false, env: MockEnv::default() }
+        SimOpts {
+            lat_ms: 3000.0,
+            ctl: ControlOpts::default(),
+            policy: crate::tweaks::Tweaks::default(),
+            late_start_h: 0.0,
+            foreign: false,
+            verbose: false,
+            env: MockEnv::default(),
+        }
     }
 }
 
@@ -660,6 +670,8 @@ pub struct SimResult {
     pub seed: u32,
     pub points: f64,
     pub bound: f64,
+    /// per-job perfect-foresight lower bound (grams), aligned with per_job
+    pub bound_per: Vec<f64>,
     pub per_job: Vec<(String, f64)>,
     pub dq: bool,
     pub grams: f64,
@@ -675,6 +687,12 @@ pub struct SimResult {
 /// Lower bound (perfect foresight, no quota, no latency): every job alone on its best legal single
 /// VM, running only in the cleanest actual hours between release and deadline.
 pub fn lower_bound(cat: &Catalog, grid: &Grid, env: &MockEnv) -> f64 {
+    lower_bound_per(cat, grid, env).0
+}
+
+/// `lowerBound` with its per-job values (`per` in mock.mjs).
+pub fn lower_bound_per(cat: &Catalog, grid: &Grid, env: &MockEnv) -> (f64, Vec<f64>) {
+    let mut per = Vec::with_capacity(cat.workloads.len());
     let mut total = 0.0;
     for w in &cat.workloads {
         let r0 = ((w.release - cat.t0) / H).ceil();
@@ -711,8 +729,9 @@ pub fn lower_bound(cat: &Catalog, grid: &Grid, env: &MockEnv) -> f64 {
             }
         }
         total += best;
+        per.push(best);
     }
-    total
+    (total, per)
 }
 
 /// One seeded mock run (`simulate()` in mock.mjs).
@@ -751,6 +770,7 @@ pub fn simulate(seed: u32, o: &SimOpts) -> SimResult {
     }
     let st = RunState { run: "mock".into(), vms: IndexMap::new(), seq: 0, deleted: vec![] };
     let mut core = Core::new(cat.clone(), st, "mockrun0", o.ctl.clone());
+    core.set_policy_tweaks(o.policy.clone());
     if o.verbose {
         let sink = lines.clone();
         // the engine clock isn't visible here; log lines carry the controller's own sim time
@@ -833,10 +853,12 @@ pub fn simulate(seed: u32, o: &SimOpts) -> SimResult {
             ));
         }
     }
+    let (bound, bound_per) = lower_bound_per(&cat, &grid, env);
     SimResult {
         seed,
         points: if engine.dq { 0.0 } else { total },
-        bound: lower_bound(&cat, &grid, env),
+        bound,
+        bound_per,
         per_job: engine.jobs.iter().enumerate().map(|(i, j)| (cat.workloads[i].id.clone(), j.g)).collect(),
         dq: engine.dq,
         grams: engine.grams,
