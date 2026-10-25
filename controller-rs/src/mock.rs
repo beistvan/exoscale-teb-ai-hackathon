@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use crate::controller::{
-    Call, ControlOpts, Core, CreateReply, HttpReply, InstanceInfo, InstanceRef, Pt, Reply, RunState, Stats, Tick, Verb,
+    Call, ControlOpts, Core, CreateReply, HttpReply, InstanceInfo, InstanceRef, Out, Pt, Reply, RunState, Stats, Tick, Verb,
 };
 use crate::glue::{Assignment, StatusDoc, WlStatus};
 use crate::jsmath;
@@ -51,6 +51,9 @@ pub struct MockEnv {
     pub quota_big: bool,
     /// MOCK_CORES
     pub cores: Option<f64>,
+    /// MOCK_STALL="h,ms[,rampS]": from sim hour h ("r": random in 60-115) every request is held ms of wall time,
+    /// after rampS seconds of 3-5 s replies (a live server stall)
+    pub stall: Option<(Option<f64>, f64, f64)>,
 }
 
 impl Default for MockEnv {
@@ -69,6 +72,7 @@ impl Default for MockEnv {
             fc_perfect: 0.0,
             quota_big: false,
             cores: None,
+            stall: None,
         }
     }
 }
@@ -111,6 +115,12 @@ impl MockEnv {
         e.fc_perfect = num("MOCK_FC_PERFECT", 0.0);
         e.quota_big = var("MOCK_QUOTA").as_deref() == Some("big");
         e.cores = var("MOCK_CORES").map(|v| crate::model::js_number(Some(&serde_json::Value::String(v))));
+        if let Some(st) = var("MOCK_STALL") {
+            let p: Vec<&str> = st.split(',').collect();
+            let n = |x: Option<&&str>| x.map(|v| crate::model::js_number(Some(&serde_json::Value::String(v.to_string())))).unwrap_or(0.0);
+            let h = if p.first() == Some(&"r") { None } else { Some(n(p.first())) };
+            e.stall = Some((h, n(p.get(1)), n(p.get(2))));
+        }
         Ok(e)
     }
 }
@@ -596,10 +606,32 @@ impl<'a> Engine<'a> {
 }
 
 enum Ev {
-    Tick,
-    Mid { id: u64, call: Call, l: f64, u: f64 },
-    End { id: u64, reply: Reply },
-    Timer { token: u64 },
+    /// the control loop's sleep of generation `generation` ends (stale when a wake-up already cut it short)
+    Tick {
+        generation: u64,
+    },
+    /// a call reaches the server (after `l * u` of its latency)
+    Mid {
+        id: u64,
+        call: Call,
+        l: f64,
+        u: f64,
+    },
+    /// MOCK_STALL: a held request continues (stage 1: after a slow ramp reply, 2: after the hold)
+    Hold {
+        id: u64,
+        call: Call,
+        l: f64,
+        u: f64,
+        stage: u8,
+    },
+    End {
+        id: u64,
+        reply: Reply,
+    },
+    Timer {
+        token: u64,
+    },
 }
 
 struct Entry {
@@ -734,6 +766,34 @@ pub fn lower_bound_per(cat: &Catalog, grid: &Grid, env: &MockEnv) -> (f64, Vec<f
     (total, per)
 }
 
+/// MOCK_STALL, after the slow-ramp check: the stall starts once the run reaches its hour; while it lasts,
+/// every request waits for its end; then the request reaches the engine.
+#[allow(clippy::too_many_arguments)]
+fn stall_hold(
+    engine: &mut Engine,
+    clock: &mut VClock,
+    stall_at: &mut Option<f64>,
+    stall: (f64, f64, f64),
+    id: u64,
+    call: Call,
+    l: f64,
+    u: f64,
+) {
+    let (sh, sms, _) = stall;
+    if stall_at.is_none() && engine.started && engine.t >= sh {
+        *stall_at = Some(clock.t);
+    }
+    if let Some(at) = *stall_at {
+        if clock.t < at + sms {
+            clock.sleep(at + sms - clock.t, Ev::Hold { id, call, l, u, stage: 2 });
+            return;
+        }
+    }
+    engine.advance_to(clock.t);
+    let reply = engine.exec(&call, clock.t);
+    clock.sleep(l * (1.0 - u), Ev::End { id, reply });
+}
+
 /// One seeded mock run (`simulate()` in mock.mjs).
 pub fn simulate(seed: u32, o: &SimOpts) -> SimResult {
     let env = &o.env;
@@ -779,45 +839,84 @@ pub fn simulate(seed: u32, o: &SimOpts) -> SimResult {
 
     let lat_ms = o.lat_ms;
     let flush = |core: &mut Core, clock: &mut VClock, rng: &mut Rng| {
-        for (id, call) in core.outbox.drain(..) {
-            let l = lat_ms * jsmath::exp(0.6 * gauss(rng));
-            let u = 0.3 + 0.6 * rng.next_f64();
-            clock.sleep(l * u, Ev::Mid { id, call, l, u });
-        }
-        for (token, ms) in core.timers.drain(..) {
-            clock.sleep(ms, Ev::Timer { token });
+        for out in core.outbox.drain(..) {
+            match out {
+                Out::Call(id, call) => {
+                    let l = lat_ms * jsmath::exp(0.6 * gauss(rng));
+                    let u = 0.3 + 0.6 * rng.next_f64();
+                    clock.sleep(l * u, Ev::Mid { id, call, l, u });
+                }
+                Out::Timer(token, ms) => clock.sleep(ms, Ev::Timer { token }),
+            }
         }
     };
+    // MOCK_STALL: drawn when the API is set up, like mock.mjs makeMockApi
+    let stall = env
+        .stall
+        .filter(|s| s.1 > 0.0)
+        .map(|(h, ms, ramp_s)| (h.unwrap_or_else(|| 60.0 + 55.0 * api_rng.next_f64()), ms, (ramp_s * 720.0) / 3600.0));
+    let mut stall_at: Option<f64> = None;
     // runLoop's first iteration runs synchronously when it is called
     let t = core.loop_tick(clock.t);
     flush(&mut core, &mut clock, &mut api_rng);
     if let Tick::Next(ms) = t {
-        clock.sleep(ms, Ev::Tick);
+        clock.sleep(ms, Ev::Tick { generation: core.loop_gen });
     }
     const WALL_LIMIT: f64 = 2.0e6;
     while !core.done {
         let Some(e) = clock.q.pop() else { break };
         clock.t = clock.t.max(e.at);
         match e.ev {
-            Ev::Tick => {
-                let t = core.loop_tick(clock.t);
-                flush(&mut core, &mut clock, &mut api_rng);
-                if let Tick::Next(ms) = t {
-                    clock.sleep(ms, Ev::Tick);
+            Ev::Tick { generation } => {
+                // (a sleep that a wake-up already cut short only moves the clock)
+                if generation == core.loop_gen {
+                    let t = core.loop_tick(clock.t);
+                    flush(&mut core, &mut clock, &mut api_rng);
+                    if let Tick::Next(ms) = t {
+                        clock.sleep(ms, Ev::Tick { generation: core.loop_gen });
+                    }
                 }
             }
-            Ev::Mid { id, call, l, u } => {
-                engine.advance_to(clock.t);
-                let reply = engine.exec(&call, clock.t);
-                clock.sleep(l * (1.0 - u), Ev::End { id, reply });
+            Ev::Mid { id, call, l, u } => match stall {
+                Some(st) => {
+                    engine.advance_to(clock.t);
+                    if stall_at.is_none() && engine.started && engine.t >= st.0 - st.2 && engine.t < st.0 {
+                        let ms = 3000.0 + 2000.0 * api_rng.next_f64();
+                        clock.sleep(ms, Ev::Hold { id, call, l, u, stage: 1 });
+                    } else {
+                        stall_hold(&mut engine, &mut clock, &mut stall_at, st, id, call, l, u);
+                    }
+                }
+                None => {
+                    engine.advance_to(clock.t);
+                    let reply = engine.exec(&call, clock.t);
+                    clock.sleep(l * (1.0 - u), Ev::End { id, reply });
+                }
+            },
+            Ev::Hold { id, call, l, u, stage } => {
+                if stage == 1 {
+                    stall_hold(&mut engine, &mut clock, &mut stall_at, stall.unwrap(), id, call, l, u);
+                } else {
+                    engine.advance_to(clock.t);
+                    let reply = engine.exec(&call, clock.t);
+                    clock.sleep(l * (1.0 - u), Ev::End { id, reply });
+                }
             }
             Ev::End { id, reply } => {
                 core.on_reply(id, reply, clock.t);
                 flush(&mut core, &mut clock, &mut api_rng);
             }
             Ev::Timer { token } => {
-                core.on_timer(token);
-                flush(&mut core, &mut clock, &mut api_rng);
+                if core.on_timer(token) {
+                    // a wake-up cut the loop's sleep short: decide now (the sleep's own entry is now stale)
+                    let t = core.loop_tick(clock.t);
+                    flush(&mut core, &mut clock, &mut api_rng);
+                    if let Tick::Next(ms) = t {
+                        clock.sleep(ms, Ev::Tick { generation: core.loop_gen });
+                    }
+                } else {
+                    flush(&mut core, &mut clock, &mut api_rng);
+                }
             }
         }
         if clock.t > WALL_LIMIT {

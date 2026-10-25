@@ -54,6 +54,14 @@ pub struct Opts {
     pub replace_min_g: f64,
     /// GPU jobs' runtime-proportional margin (None: margin_frac)
     pub margin_frac_gpu: Option<f64>,
+    /// with prestage: a staged job releasing within the action lead is gated on its release hour
+    pub staged_gate: bool,
+    /// sim hours a stopped job must keep before its deadline (set by the controller each step)
+    pub stall_h: f64,
+    /// <1: a fresh job with slack > picky_min_slack_h starts only in this fraction of its gate's clean hours
+    pub picky_frac: f64,
+    pub picky_min_slack_h: f64,
+    pub picky_gpu_only: bool,
 }
 
 impl Opts {
@@ -97,6 +105,11 @@ impl Opts {
             replace_min_rel: 0.15,
             replace_min_g: 100.0,
             margin_frac_gpu: None,
+            staged_gate: true,
+            stall_h: 0.0,
+            picky_frac: 1.0,
+            picky_min_slack_h: 24.0,
+            picky_gpu_only: true,
         };
         if !tw.is_empty() {
             let b = |v: f64| v != 0.0;
@@ -130,6 +143,10 @@ impl Opts {
                     "replace_foreign" => o.replace_foreign = b(v),
                     "replace_min_rel" => o.replace_min_rel = v,
                     "replace_min_g" => o.replace_min_g = v,
+                    "staged_gate" => o.staged_gate = b(v),
+                    "picky_frac" => o.picky_frac = v,
+                    "picky_min_slack_h" => o.picky_min_slack_h = v,
+                    "picky_gpu_only" => o.picky_gpu_only = b(v),
                     _ => {}
                 }
             }
@@ -198,6 +215,9 @@ pub struct View {
     pub fc: Vec<Option<Arc<Vec<f64>>>>,
     /// version of each area's forecast (same version = same values; lets the policy reuse its windows)
     pub fc_ver: Vec<u64>,
+    /// placement forecast per area: the mean of the newest vintages (`view.fcPlace`); None = use `fc`
+    pub fc_place: Option<Vec<Option<Arc<Vec<f64>>>>>,
+    pub fc_place_ver: Vec<u64>,
 }
 
 impl View {
@@ -274,6 +294,8 @@ struct Fp {
 
 #[derive(Clone, Debug)]
 struct Item {
+    /// workload index
+    wi: usize,
     fp: Fp,
     need_h: f64,
     due: f64,
@@ -368,23 +390,31 @@ impl Win {
         }
         Some(self.sorted[w][n as usize - 1])
     }
-    /// `gate()` / `withinNoise()` / `hourSaving()` share the window: W hours, run in the n cheapest.
+    /// `withinNoise()`'s window: W hours, run in the n cheapest.
     fn window(&self, need_h: f64, avail_h: f64) -> (usize, f64) {
         let w = jmax(1.0, jmin(self.len() as f64, avail_h.floor()));
         let n = jmin(w, ((w * need_h) / avail_h + 1e-9).ceil());
         (if w.is_nan() { 0 } else { w as usize }, n)
     }
+    /// `gate()` / `hourSaving()`'s window: as above, at least 1 hour, and only the cheapest `frac` of
+    /// them (`pickyFrac`; 1 = all).
+    fn window_frac(&self, need_h: f64, avail_h: f64, frac: f64) -> (usize, f64) {
+        let w = jmax(1.0, jmin(self.len() as f64, avail_h.floor()));
+        let n = jmin(w, jmax(1.0, ((frac * w * need_h) / avail_h + 1e-9).ceil()));
+        (if w.is_nan() { 0 } else { w as usize }, n)
+    }
 }
 
-/// Proportional rule: within the visible window, run in the cheapest ceil(W*need/avail) hours.
-fn gate(fc: &Win, need_h: f64, avail_h: f64) -> bool {
+/// Proportional rule: within the visible window, run in the cheapest ceil(W*need/avail) hours
+/// (frac < 1: only the cheapest frac of those — a pickier start).
+fn gate(fc: &Win, need_h: f64, avail_h: f64, frac: f64) -> bool {
     if need_h <= 0.0 {
         return true;
     }
     if fc.is_empty() || need_h >= avail_h - 0.25 {
         return true;
     }
-    let (w, n) = fc.window(need_h, avail_h);
+    let (w, n) = fc.window_frac(need_h, avail_h, frac);
     match fc.nth(w, n) {
         Some(thr) => fc.fc[0] <= thr + 1e-9,
         None => false, // JS: fc[0] <= undefined + 1e-9 is false
@@ -404,11 +434,11 @@ fn within_noise(fc: &Win, need_h: f64, avail_h: f64, band: f64) -> bool {
 }
 
 /// gCO2e/kWh saved by moving the current hour of work to the hour the gate would use instead.
-fn hour_saving(fc: &Win, need_h: f64, avail_h: f64) -> f64 {
+fn hour_saving(fc: &Win, need_h: f64, avail_h: f64, frac: f64) -> f64 {
     if fc.is_empty() || need_h >= avail_h - 0.25 {
         return 0.0;
     }
-    let (w, n) = fc.window(need_h, avail_h);
+    let (w, n) = fc.window_frac(need_h, avail_h, frac);
     match fc.nth(w, n) {
         Some(thr) => jmax(0.0, fc.fc[0] - thr),
         None => f64::NAN,
@@ -428,6 +458,10 @@ pub struct Policy {
     /// sorted forecast windows by area index, with the forecast version they were built from
     wins: Vec<Win>,
     win_ver: Vec<u64>,
+    /// the same for the placement forecast (`fcPlace`), when the view has one
+    place_wins: Vec<Win>,
+    place_ver: Vec<u64>,
+    use_place: bool,
     empty: Win,
     /// experiment overrides (empty: the JS defaults)
     pub tweaks: Tweaks,
@@ -445,6 +479,9 @@ impl Policy {
             ff_cards: vec![Vec::new(); cat.quota.cards.len()],
             wins: Vec::new(),
             win_ver: Vec::new(),
+            place_wins: Vec::new(),
+            place_ver: Vec::new(),
+            use_place: false,
             empty: Win::new(&[]),
             tweaks: Tweaks::default(),
         }
@@ -453,6 +490,11 @@ impl Policy {
     /// The corrected forecast window for a zone's area (empty when the area has no forecast).
     fn win(&self, zone: usize) -> &Win {
         self.wins.get(self.zone_area[zone]).unwrap_or(&self.empty)
+    }
+
+    /// The placement forecast window (`view.fcPlace ?? view.fc`).
+    fn place_win(&self, zone: usize) -> &Win {
+        if self.use_place { self.place_wins.get(self.zone_area[zone]).unwrap_or(&self.empty) } else { self.win(zone) }
     }
 
     fn footprint(&self, cat: &Catalog, prof: usize, k: f64) -> Fp {
@@ -488,7 +530,7 @@ impl Policy {
             return None;
         }
         let avail_h = if p.is_cpu { jmax(need_h / max_duty, jmin(hard_h, o.cpu_window_h)) } else { hard_h };
-        let fc = self.win(c.zone);
+        let fc = self.place_win(c.zone);
         if fc.is_empty() {
             return None;
         }
@@ -569,7 +611,7 @@ impl Policy {
                 let p = &cat.profiles[c.prof];
                 let z = &cat.zones[c.zone];
                 let need_h = setup_h(w, p) + rem / (c.rate * cal) + output_h(w);
-                let fc = self.win(c.zone);
+                let fc = self.place_win(c.zone);
                 let mean = if fc.is_empty() { 1e3 } else { fc.cheapest_mean(fc.len(), 24.0) };
                 let grams = (c.k * p.watts * need_h * z.pue * mean) / 1000.0;
                 Placement {
@@ -732,8 +774,17 @@ impl Policy {
 
     /// One decision. `margin_min_h` and `lat_h` are the controller's per-step overrides.
     /// Returns actions in the JS order (deletes, staged stops, pauses/resumes, creates, clock start).
-    pub fn decide(&mut self, cat: &Catalog, view: &View, memo: &mut FxMap<String, Memo>, margin_min_h: f64, lat_h: f64) -> Vec<Action> {
-        let o = Opts::resolve_with(margin_min_h, lat_h, &self.tweaks);
+    pub fn decide(
+        &mut self,
+        cat: &Catalog,
+        view: &View,
+        memo: &mut FxMap<String, Memo>,
+        margin_min_h: f64,
+        lat_h: f64,
+        stall_h: f64,
+    ) -> Vec<Action> {
+        let mut o = Opts::resolve_with(margin_min_h, lat_h, &self.tweaks);
+        o.stall_h = stall_h;
         if self.wins.len() != view.fc.len() {
             self.wins = view.fc.iter().map(|_| Win::new(&[])).collect();
             self.win_ver = vec![u64::MAX; view.fc.len()];
@@ -743,6 +794,20 @@ impl Policy {
             if self.win_ver[i] != ver || ver == 0 {
                 self.wins[i] = Win::new(f.as_ref().map(|a| a.as_slice()).unwrap_or(&[]));
                 self.win_ver[i] = ver;
+            }
+        }
+        self.use_place = view.fc_place.is_some();
+        if let Some(fp) = &view.fc_place {
+            if self.place_wins.len() != fp.len() {
+                self.place_wins = fp.iter().map(|_| Win::new(&[])).collect();
+                self.place_ver = vec![u64::MAX; fp.len()];
+            }
+            for (i, f) in fp.iter().enumerate() {
+                let ver = view.fc_place_ver.get(i).copied().unwrap_or(u64::MAX - 1);
+                if self.place_ver[i] != ver || ver == 0 {
+                    self.place_wins[i] = Win::new(f.as_ref().map(|a| a.as_slice()).unwrap_or(&[]));
+                    self.place_ver[i] = ver;
+                }
             }
         }
         let mut acts: Vec<Action> = Vec::new();
@@ -805,6 +870,7 @@ impl Policy {
                 let f = Fp { vms: n, cores: 40.0 * n, fam: None, cards: 0.0 };
                 add_held(&mut held_open, &f);
                 items.push(Item {
+                    wi: j.w,
                     fp: f,
                     need_h: jmax(0.5, deadline_h(j) - t_h),
                     due: deadline_h(j),
@@ -856,7 +922,7 @@ impl Policy {
             add_held(&mut held_open, &f);
             // staging may run before release (the engine allows it), so it overlaps the wait
             let need_h = (if o.prestage { jmax(wait, setup_left) - setup_left } else { wait }) + run_need;
-            let item = Item { fp: f, need_h, due, deployed: true, start_at: t_h, avail: 0.0 };
+            let item = Item { wi: j.w, fp: f, need_h, due, deployed: true, start_at: t_h, avail: 0.0 };
             // staged and still waiting for release: stop it (0 W, keeps the staged input) until release
             let all_rs = j.vms.iter().all(|v| v.state == "running" || v.state == "stopped");
             let staged_waiting = o.prestage && wait > o.lat_h + 0.15 && setup_left <= 0.0 && j.done <= 0.0 && all_rs;
@@ -869,13 +935,25 @@ impl Policy {
                 items.push(item);
                 continue;
             }
-            let pausable = (cpu_pause || !prof.is_cpu) && rem > 1e-6 && wait <= 0.0 && all_rs;
-            let fc = self.win(zi);
+            // stagedGate: staged and releasing within the action lead — judge the release hour now instead of
+            // starting unconditionally (a start just before a dirty release hour was then held running)
+            let near_rel = o.staged_gate && o.prestage && wait > 0.0 && setup_left <= 0.0 && j.done <= 0.0;
+            let pausable = (cpu_pause || !prof.is_cpu) && rem > 1e-6 && (wait <= 0.0 || near_rel) && all_rs;
+            let fc_now = self.win(zi);
+            let sliced;
+            let fc: &Win = if near_rel && fc_now.len() > 1 {
+                let from = jmin(fc_now.len() as f64 - 1.0, jmax(0.0, crate::jsmath::round(rel_h(j)) - t_h.floor())) as usize;
+                sliced = Win::new(&fc_now.fc[from..]);
+                &sliced
+            } else {
+                fc_now
+            };
             let since_h = t_h - j.deployed_h.unwrap_or(t_h);
-            let avail_h = if prof.is_cpu { jmin(due - t_h, jmax(run_need, o.cpu_window_h - since_h)) } else { due - t_h };
-            let gate_run = !pausable || gate(fc, run_need, avail_h) || within_noise(fc, run_need, avail_h, o.noise_band);
+            let avail_h = (if prof.is_cpu { jmin(due - t_h, jmax(run_need, o.cpu_window_h - since_h)) } else { due - t_h })
+                - (if near_rel { wait } else { 0.0 });
+            let gate_run = !pausable || gate(fc, run_need, avail_h, 1.0) || within_noise(fc, run_need, avail_h, o.noise_band);
             let value =
-                if pausable && !gate_run { ((prof.watts * k) / 1000.0) * zone.pue * hour_saving(fc, run_need, avail_h) } else { 0.0 };
+                if pausable && !gate_run { ((prof.watts * k) / 1000.0) * zone.pue * hour_saving(fc, run_need, avail_h, 1.0) } else { 0.0 };
             let fc_mean = if !fc.is_empty() { fc.fc.iter().fold(0.0, |a, b| a + b) / fc.len() as f64 } else { 0.0 };
             let est_g =
                 ((prof.watts * k) / 1000.0) * (setup_h(w, prof) + w.required / rate_k(w, prof, k) + output_h(w)) * zone.pue * fc_mean;
@@ -947,7 +1025,7 @@ impl Policy {
             let f = self.footprint(cat, use_.prof, use_.k);
             let up = &cat.profiles[use_.prof];
             let due = deadline_h(j) - margin_h(&o, use_.need_h, !up.is_cpu);
-            items.push(Item { fp: f, need_h: use_.need_h, due, deployed: false, start_at: 0.0, avail: t_h });
+            items.push(Item { wi: j.w, fp: f, need_h: use_.need_h, due, deployed: false, start_at: 0.0, avail: t_h });
             if pick.is_some() {
                 free.vms += f.vms;
                 free.cores += f.cores;
@@ -956,14 +1034,26 @@ impl Policy {
                 }
             }
             let fc = self.win(use_.zone);
+            // pickyStart: a job with much more slack than its forecast can see starts (and commits its zone)
+            // only in its very cleanest hours, so later forecasts can still move it
             let win = jmin(use_.hard_h, o.cpu_window_h);
+            let fr = if o.picky_frac < 1.0
+                && pick.is_some()
+                && !use_.forced
+                && (!o.picky_gpu_only || !up.is_cpu)
+                && use_.hard_h - use_.need_h > o.picky_min_slack_h
+            {
+                o.picky_frac
+            } else {
+                1.0
+            };
             let gate_now = use_.forced
                 || pick.is_none()
                 || (!cpu_pause && up.is_cpu)
-                || gate(fc, use_.need_h, win)
-                || within_noise(fc, use_.need_h, win, o.noise_band);
+                || gate(fc, use_.need_h, win, fr)
+                || (fr == 1.0 && within_noise(fc, use_.need_h, win, o.noise_band));
             let value = if pick.is_some() && !gate_now {
-                ((up.watts * use_.k) / 1000.0) * cat.zones[use_.zone].pue * hour_saving(fc, use_.need_h, win)
+                ((up.watts * use_.k) / 1000.0) * cat.zones[use_.zone].pue * hour_saving(fc, use_.need_h, win, fr)
             } else {
                 0.0
             };
@@ -984,6 +1074,7 @@ impl Policy {
             let Some(best) = single(&list, list.first()) else { continue };
             let gpu = !cat.profiles[best.prof].is_cpu;
             items.push(Item {
+                wi: j.w,
                 fp: self.footprint(cat, best.prof, best.k),
                 need_h: best.need_h,
                 due: deadline_h(j) - margin_h(&o, best.need_h, gpu),
@@ -1096,6 +1187,14 @@ impl Policy {
                 }
                 let r = self.fast_forward(cat, t_h, &base, &items);
                 let mut ok = r.late(c.item, &items) <= -buffer;
+                // stall guard: a stopped (or not yet created) job must still finish stall_h before its real
+                // deadline, so a start/create that the server holds that long still lands in time
+                if ok
+                    && o.stall_h > 0.0
+                    && r.finish[c.item].unwrap_or(f64::INFINITY) > (cat.workloads[items[c.item].wi].deadline - cat.t0) / H - o.stall_h
+                {
+                    ok = false;
+                }
                 if ok {
                     for (i, b0) in base0.iter().enumerate() {
                         if r.late(i, &items) > jmax(*b0, -cushion) + 1e-6 {

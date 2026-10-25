@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::controller::{Call, ControlOpts, Core, CreateReply, HttpReply, Reply, RunState, Tick};
+use crate::controller::{Call, ControlOpts, Core, CreateReply, HttpReply, Out, Reply, RunState, Tick};
 use crate::live::{Creds, LiveApi, LogFn};
 use crate::model::Catalog;
 
@@ -96,7 +96,18 @@ fn guard<T>(log: &LogFn, what: &str, f: impl FnOnce() -> T) -> Option<T> {
 /// Executes the core's calls as tasks. In dry mode the writes are answered locally (as the JS
 /// `dryApi` does) and never reach the transport, which would refuse them anyway.
 fn dispatch(core: &mut Core, api: &Arc<LiveApi>, dry: bool, tx: &mpsc::UnboundedSender<(u64, Reply)>, ttx: &mpsc::UnboundedSender<u64>) {
-    for (id, call) in core.outbox.drain(..) {
+    for out in core.outbox.drain(..) {
+        let (id, call) = match out {
+            Out::Call(id, call) => (id, call),
+            Out::Timer(token, ms) => {
+                let ttx = ttx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(ms as u64)).await;
+                    let _ = ttx.send(token);
+                });
+                continue;
+            }
+        };
         let api = api.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -118,13 +129,6 @@ fn dispatch(core: &mut Core, api: &Arc<LiveApi>, dry: bool, tx: &mpsc::Unbounded
                 Call::ListInstances { zone } => Reply::List(api.list_instances(&zone).await),
             };
             let _ = tx.send((id, reply));
-        });
-    }
-    for (token, ms) in core.timers.drain(..) {
-        let ttx = ttx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(ms as u64)).await;
-            let _ = ttx.send(token);
         });
     }
 }
@@ -196,7 +200,7 @@ pub async fn main(opts: Options) -> i32 {
         while now_ms() < deadline && !(core.snap.is_some() && core.has_forecasts()) {
             core.poll_status(now_ms());
             if let Some(t) = core.t_now(now_ms()) {
-                core.refresh_forecasts(t.floor() as i64);
+                core.refresh_forecasts(t.floor() as i64, now_ms());
             }
             dispatch(&mut core, &api, true, &tx, &ttx);
             let sleep = tokio::time::sleep(Duration::from_millis(300));
@@ -215,7 +219,8 @@ pub async fn main(opts: Options) -> i32 {
         let state = core.snap.as_ref().map(|s| s.state.clone()).unwrap_or_default();
         log(&format!("[dry] run state {state}; t≈{:.2}h; lat≈{:.2}h", core.t_now(now_ms()).unwrap_or(0.0), core.lat_h()));
         core.step(now_ms());
-        for (_, c) in &core.outbox {
+        for out in &core.outbox {
+            let Out::Call(_, c) = out else { continue };
             match c {
                 Call::Create { zone, prof, name, wl } => log(&format!(
                     "[dry] would create {wl} → {zone} {} ({name})",
@@ -295,7 +300,12 @@ pub async fn main(opts: Options) -> i32 {
                     }
                 }
                 Some(token) = trx.recv() => {
-                    guard(&log, "timer", || core.on_timer(token));
+                    // a wake-up after new data cuts the sleep short: decide now
+                    if guard(&log, "timer", || core.on_timer(token)).unwrap_or(false) {
+                        tick = tick_now(&mut core);
+                        break;
+                    }
+                    dispatch(&mut core, &api, false, &tx, &ttx);
                 }
             }
         }

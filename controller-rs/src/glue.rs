@@ -196,5 +196,15 @@ pub fn build_view(
             (u, crate::model::jmin(1.0, m))
         })
         .collect();
-    View { t, state: status.state.to_uppercase(), usage, jobs, calib, fc: Vec::new(), fc_ver: Vec::new() }
+    View {
+        t,
+        state: status.state.to_uppercase(),
+        usage,
+        jobs,
+        calib,
+        fc: Vec::new(),
+        fc_ver: Vec::new(),
+        fc_place: None,
+        fc_place_ver: Vec::new(),
+    }
 }

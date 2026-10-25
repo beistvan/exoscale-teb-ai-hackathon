@@ -37,6 +37,30 @@ pub struct ControlOpts {
     pub latency_margin_x: f64,
     /// don't stop the same VM again sooner than this after a toggle (sim hours)
     pub min_dwell_h: f64,
+    /// planning latency = median of the last 15 calls (not an EWMA a single stall can blow up)
+    pub lat_robust: bool,
+    /// fetch each area's forecast (and observations) until the held vintage is the server's current hour
+    pub fresh_fc: bool,
+    /// ...wall gap between such re-fetches per area (ms)
+    pub fc_retry_ms: f64,
+    /// placement estimates average the newest N forecast vintages (each corrected for its own lead)
+    pub place_vintages: f64,
+    /// sleep only until the next hour boundary (action time or server time), not a whole loop
+    pub align_boundary: bool,
+    /// decide as soon as a newer forecast vintage or observation arrives...
+    pub wake_on_data: bool,
+    /// ...after this short wait, so one hour's burst of replies triggers one decision (ms)
+    pub wake_debounce_ms: f64,
+    /// inside the stop dwell, still allow a stop when new data arrived since the last toggle
+    pub info_dwell: bool,
+    /// wall seconds a paused / not-yet-created job must keep before its deadline while the server shows stress
+    pub stall_buffer_s: f64,
+    /// ...and always
+    pub stall_base_s: f64,
+    /// stress = a call slower than this (ms), finished or still in flight,
+    pub stall_trigger_ms: f64,
+    /// ...within this many wall seconds
+    pub stall_memory_s: f64,
     /// cap on the latency used for planning (sim hours)
     pub max_lat_h: f64,
     /// learn each area's forecast error by lead time from this run's own published observations
@@ -61,6 +85,18 @@ impl ControlOpts {
                 "base_margin_h" => self.base_margin_h = v,
                 "latency_margin_x" => self.latency_margin_x = v,
                 "min_dwell_h" => self.min_dwell_h = v,
+                "lat_robust" => self.lat_robust = v != 0.0,
+                "fresh_fc" => self.fresh_fc = v != 0.0,
+                "fc_retry_ms" => self.fc_retry_ms = v,
+                "place_vintages" => self.place_vintages = v,
+                "align_boundary" => self.align_boundary = v != 0.0,
+                "wake_on_data" => self.wake_on_data = v != 0.0,
+                "wake_debounce_ms" => self.wake_debounce_ms = v,
+                "info_dwell" => self.info_dwell = v != 0.0,
+                "stall_buffer_s" => self.stall_buffer_s = v,
+                "stall_base_s" => self.stall_base_s = v,
+                "stall_trigger_ms" => self.stall_trigger_ms = v,
+                "stall_memory_s" => self.stall_memory_s = v,
                 "max_lat_h" => self.max_lat_h = v,
                 "learn_bias" => self.learn_bias = v != 0.0,
                 "bias_shrink_n" => self.bias_shrink_n = v,
@@ -82,7 +118,21 @@ impl Default for ControlOpts {
             status_gap_ms: 700.0,
             base_margin_h: 4.0,
             latency_margin_x: 2.5,
-            min_dwell_h: 0.6,
+            // was 0.6: with fresh vintages a start decided from vintage h-1 that vintage h overturns was held
+            // running for most of a dirty hour
+            min_dwell_h: 0.1,
+            lat_robust: true,
+            fresh_fc: true,
+            fc_retry_ms: 100.0,
+            place_vintages: 3.0,
+            align_boundary: true,
+            wake_on_data: true,
+            wake_debounce_ms: 30.0,
+            info_dwell: true,
+            stall_buffer_s: 35.0,
+            stall_base_s: 10.0,
+            stall_trigger_ms: 2000.0,
+            stall_memory_s: 60.0,
             max_lat_h: 4.0,
             learn_bias: true,
             bias_shrink_n: 24.0,
@@ -203,6 +253,22 @@ pub enum Reply {
     List(Vec<InstanceRef>),
 }
 
+/// Work for the driver, in issue order: an API call to run, or a timer to arm (wall ms). Order matters
+/// to the simulator, where each one is a virtual-clock entry like a JS `clock.sleep`.
+#[derive(Clone, Debug)]
+pub enum Out {
+    Call(u64, Call),
+    Timer(u64, f64),
+}
+
+#[derive(Clone, Debug)]
+enum TimerKind {
+    /// retry adopting a foreign VM
+    Adopt(String),
+    /// `wakeUp()`'s debounce: run the next decision now if the loop is asleep
+    Wake,
+}
+
 /// What to do when a call returns (the JS promise continuations).
 #[derive(Clone, Debug)]
 enum Cont {
@@ -211,7 +277,7 @@ enum Cont {
     History { area: String, hour: i64 },
     Create { wl: String, zone: String, prof: String, name: String, t_act: f64, t_now0: f64, t0: f64, why: String },
     CreateFind { wl: String, zone: String, prof: String, name: String, t_act: f64, t_now0: f64, t0: f64, why: String, err: String },
-    Vm { delete: bool, verb: Option<Verb>, wl: String, id: String, t_act: f64, t_now0: f64, t0: f64, why: String },
+    Vm { delete: bool, verb: Option<Verb>, wl: String, id: String, t_act: f64, t_now0: f64, t0: f64, why: String, ver0: u64 },
     Adopt { wl: String, zone: Option<String>, id: String },
     FinalRemove { id: String },
     FinalList { zone: String },
@@ -275,6 +341,16 @@ struct FcEntry {
     hour: i64,
     vh: i64,
     pts: Vec<Pt>,
+}
+
+/// Cached corrected forecasts of one area for one hour (planning and placement), with versions.
+#[derive(Clone, Debug)]
+struct FcView {
+    hour_start: f64,
+    fc: Option<std::sync::Arc<Vec<f64>>>,
+    ver: u64,
+    place: Option<std::sync::Arc<Vec<f64>>>,
+    place_ver: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -363,7 +439,7 @@ pub struct Core {
     bias_cache: FxMap<String, Bias>,
     /// corrected forecast per area: (hour start, values, version) — a pure function of the area's
     /// published forecast, its bias and the hour, so it is reused until one of them changes
-    fc_view: FxMap<String, (f64, std::sync::Arc<Vec<f64>>, u64)>,
+    fc_view: FxMap<String, FcView>,
     fc_ver: u64,
     in_create: IndexMap<String, InCreate>,
     in_vm: FxMap<String, &'static str>,
@@ -378,11 +454,28 @@ pub struct Core {
     fin: Option<Finalize>,
     next_id: u64,
     conts: FxMap<u64, Cont>,
-    /// calls to execute, in issue order
-    pub outbox: Vec<(u64, Call)>,
-    /// timers to arm: (token, delay ms) — adoption retries
-    pub timers: Vec<(u64, f64)>,
-    timer_conts: FxMap<u64, String>,
+    /// calls to execute and timers to arm, in issue order
+    pub outbox: Vec<Out>,
+    timer_conts: FxMap<u64, TimerKind>,
+    // fresh vintages
+    fc_ask: FxMap<String, f64>,
+    fc_try: FxMap<String, (i64, u32)>,
+    hist_try: FxMap<String, (i64, u32, f64)>,
+    hist_newest: FxMap<String, i64>,
+    hist_lag: Option<i64>,
+    /// bumped whenever new forecast or observation data arrives
+    data_ver: u64,
+    toggle_ver: FxMap<String, u64>,
+    // robust latency + stall guard
+    lat_recent_status: Vec<f64>,
+    lat_recent_cloud: Vec<f64>,
+    status_open: Vec<f64>,
+    last_slow: Option<f64>,
+    // loop timing: `this.wake` is set while the loop sleeps; a debounced wake-up cuts the sleep short
+    wake_pending: bool,
+    loop_sleeping: bool,
+    /// generation of the loop's current sleep (a sleep cut short leaves a stale timer behind)
+    pub loop_gen: u64,
     log: Option<LogFn>,
     event: Option<EventFn>,
 }
@@ -432,8 +525,21 @@ impl Core {
             next_id: 0,
             conts: FxMap::default(),
             outbox: Vec::new(),
-            timers: Vec::new(),
             timer_conts: FxMap::default(),
+            fc_ask: FxMap::default(),
+            fc_try: FxMap::default(),
+            hist_try: FxMap::default(),
+            hist_newest: FxMap::default(),
+            hist_lag: None,
+            data_ver: 0,
+            toggle_ver: FxMap::default(),
+            lat_recent_status: Vec::new(),
+            lat_recent_cloud: Vec::new(),
+            status_open: Vec::new(),
+            last_slow: None,
+            wake_pending: false,
+            loop_sleeping: false,
+            loop_gen: 0,
             log: None,
             event: None,
         }
@@ -483,7 +589,55 @@ impl Core {
     fn call(&mut self, c: Call, k: Cont) {
         self.next_id += 1;
         self.conts.insert(self.next_id, k);
-        self.outbox.push((self.next_id, c));
+        self.outbox.push(Out::Call(self.next_id, c));
+    }
+
+    fn timer(&mut self, kind: TimerKind, ms: f64) {
+        self.next_id += 1;
+        self.timer_conts.insert(self.next_id, kind);
+        self.outbox.push(Out::Timer(self.next_id, ms));
+    }
+
+    /// New data arrived: run the next decision soon (debounced, so the hour's burst of replies triggers one step).
+    fn wake_up(&mut self) {
+        if !self.o.wake_on_data || self.wake_pending {
+            return;
+        }
+        self.wake_pending = true;
+        self.timer(TimerKind::Wake, self.o.wake_debounce_ms);
+    }
+
+    fn lat_sample(&mut self, cloud: bool, ms: f64, now: f64) {
+        let a = if cloud { &mut self.lat_recent_cloud } else { &mut self.lat_recent_status };
+        a.push(ms);
+        if a.len() > 15 {
+            a.remove(0);
+        }
+        if ms > self.o.stall_trigger_ms {
+            self.last_slow = Some(now);
+        }
+    }
+
+    /// Wall seconds of deadline cushion a paused job needs now: more while the server shows stress.
+    pub fn stall_s(&self, now: f64) -> f64 {
+        let open = self.status_open.iter().any(|t0| now - t0 > self.o.stall_trigger_ms);
+        if open || now - self.last_slow.unwrap_or(-1e15) < self.o.stall_memory_s * 1000.0 {
+            self.o.stall_buffer_s
+        } else {
+            self.o.stall_base_s
+        }
+    }
+
+    /// Wall ms until the action time or the server clock reaches its next hour (infinite unless running).
+    fn ms_to_boundary(&self, now: f64) -> f64 {
+        let Some(s) = self.snap.as_ref() else { return f64::INFINITY };
+        if s.state != "RUNNING" {
+            return f64::INFINITY;
+        }
+        let t_now = self.t_now(now).unwrap();
+        let t_act = t_now + self.lat_h();
+        let dh = jmin((t_act + 1e-9).ceil() - t_act, (t_now + 1e-9).ceil() - t_now);
+        (dh * H) / s.speed
     }
 
     fn save(&mut self) {
@@ -498,28 +652,72 @@ impl Core {
         }
         self.status_inflight += 1;
         self.last_status_start = now;
+        self.status_open.push(now);
         self.call(Call::Status, Cont::Status { t0: now });
     }
 
-    pub fn refresh_forecasts(&mut self, hour: i64) {
+    /// freshFc: the server issues one vintage per hour, and `hour` (the action time) runs ahead of the
+    /// server clock by the API latency — re-fetch while the held vintage is older than the server's hour.
+    pub fn refresh_forecasts(&mut self, hour: i64, now: f64) {
+        let srv_hour = self.t_now(now).map(|t| t.floor() as i64).unwrap_or(hour);
         for a in self.areas.clone() {
-            if self.fc.get(&a).map(|c| c.hour) == Some(hour) || self.fc_inflight.contains(&a) {
+            if self.fc_inflight.contains(&a) {
                 continue;
             }
+            let tr = self.fc_try.get(&a).copied();
+            let skip = if self.o.fresh_fc {
+                match self.fc.get(&a) {
+                    None => false,
+                    Some(held) => {
+                        // (at most 4 asks per area per server hour)
+                        !(held.vh < srv_hour
+                            && now - self.fc_ask.get(&a).copied().unwrap_or(-1e15) >= self.o.fc_retry_ms
+                            && !tr.is_some_and(|(h, n)| h == srv_hour && n >= 4))
+                    }
+                }
+            } else {
+                self.fc.get(&a).map(|c| c.hour) == Some(hour)
+            };
+            if skip {
+                continue;
+            }
+            self.fc_ask.insert(a.clone(), now);
+            let n = match tr {
+                Some((h, n)) if h == srv_hour => n + 1,
+                _ => 1,
+            };
+            self.fc_try.insert(a.clone(), (srv_hour, n));
             self.fc_inflight.insert(a.clone());
             self.call(Call::Forecast { area: a.clone() }, Cont::Forecast { area: a, hour });
         }
     }
 
     /// Published observations (this run only), fetched once per simulated hour per area.
-    pub fn refresh_history(&mut self, hour: i64) {
+    pub fn refresh_history(&mut self, hour: i64, now: f64) {
         if !self.o.learn_bias {
             return;
         }
         for a in self.areas.clone() {
-            if self.hist_hour.get(&a) == Some(&hour) || self.hist_inflight.contains(&a) {
+            if self.hist_inflight.contains(&a) {
                 continue;
             }
+            let m = self.hist_try.get(&a).copied();
+            if self.hist_hour.get(&a) == Some(&hour) {
+                // freshFc: a fetch that reached the server just before its hour turned misses this hour's newest
+                // point; re-ask (spaced, at most 3 times an hour) while it is older than this run's publication lag
+                let Some(lag) = self.hist_lag else { continue };
+                if !self.o.fresh_fc
+                    || !(self.hist_newest.get(&a).map(|x| *x as f64).unwrap_or(f64::NEG_INFINITY) < (hour - lag) as f64)
+                    || m.is_some_and(|(h, n, ask)| h == hour && (n >= 3 || now - ask < self.o.fc_retry_ms))
+                {
+                    continue;
+                }
+            }
+            let n = match m {
+                Some((h, n, _)) if h == hour => n + 1,
+                _ => 1,
+            };
+            self.hist_try.insert(a.clone(), (hour, n, now));
             self.hist_inflight.insert(a.clone());
             self.call(Call::History { area: a.clone() }, Cont::History { area: a, hour });
         }
@@ -608,7 +806,21 @@ impl Core {
     }
 
     pub fn lat_h(&self) -> f64 {
-        let ms = self.lat_cloud.or(self.lat_status).unwrap_or(1000.0);
+        // latRobust: plan with the median of the last 15 calls — one stalled reply otherwise lifted the EWMA to
+        // hours of "latency", switched off every low-lag setting and inflated all margins
+        let med = |a: &Vec<f64>| -> Option<f64> {
+            if a.is_empty() {
+                return None;
+            }
+            let mut s = a.clone();
+            crate::model::sort_num(&mut s);
+            Some(s[s.len() / 2])
+        };
+        let ms = if self.o.lat_robust {
+            med(&self.lat_recent_cloud).or_else(|| med(&self.lat_recent_status)).unwrap_or(1000.0)
+        } else {
+            self.lat_cloud.or(self.lat_status).unwrap_or(1000.0)
+        };
         let speed = self.snap.as_ref().map(|s| s.speed).unwrap_or(720.0);
         jmin(self.o.max_lat_h, (ms * speed) / H)
     }
@@ -660,32 +872,84 @@ impl Core {
         let now_hour = t_act.floor();
         let hour_start = self.cat.t0 + now_hour * H;
         let areas = self.areas.clone();
-        let mut fc = Vec::with_capacity(areas.len());
-        let mut ver = Vec::with_capacity(areas.len());
+        let place_on = self.o.place_vintages > 1.0 && self.o.learn_bias;
+        let (mut fc, mut ver, mut place, mut place_ver) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for a in &areas {
-            match self.fc_view.get(a) {
-                Some((hs, arr, n)) if *hs == hour_start => {
-                    fc.push(Some(arr.clone()));
-                    ver.push(*n);
-                }
-                _ => match self.fc_for(a, hour_start) {
-                    Some(arr) => {
+            let hit = self.fc_view.get(a).filter(|c| c.hour_start == hour_start).cloned();
+            let e = match hit {
+                Some(e) => e,
+                None => {
+                    let arr = self.fc_for(a, hour_start).map(std::sync::Arc::new);
+                    let pl = if place_on { self.fc_place_for(a, hour_start, arr.as_deref()).map(std::sync::Arc::new) } else { None };
+                    let mut e = FcView { hour_start, fc: arr, ver: 0, place: pl, place_ver: 0 };
+                    if e.fc.is_some() {
                         self.fc_ver += 1;
-                        let arr = std::sync::Arc::new(arr);
-                        self.fc_view.insert(a.clone(), (hour_start, arr.clone(), self.fc_ver));
-                        fc.push(Some(arr));
-                        ver.push(self.fc_ver);
+                        e.ver = self.fc_ver;
                     }
-                    None => {
-                        fc.push(None);
-                        ver.push(0);
+                    if e.place.is_some() {
+                        self.fc_ver += 1;
+                        e.place_ver = self.fc_ver;
                     }
-                },
-            }
+                    self.fc_view.insert(a.clone(), e.clone());
+                    e
+                }
+            };
+            fc.push(e.fc);
+            ver.push(e.ver);
+            place.push(e.place);
+            place_ver.push(e.place_ver);
         }
         v.fc = fc;
         v.fc_ver = ver;
+        if place_on {
+            v.fc_place = Some(place);
+            v.fc_place_ver = place_ver;
+        }
         v
+    }
+
+    /// The corrected value of a point from the vintage issued at hour vh (its lead decides the bias applied).
+    fn corrected(&self, b: &Option<Bias>, vh: i64, p: &Pt) -> f64 {
+        let Some(b) = b else { return p.v };
+        let cap = 2.0 * self.o.bias_cap;
+        let tau = (p.t - self.cat.t0) / H;
+        let ix = jmax(0.0, jmin(24.0, jsmath::round(tau - vh as f64)));
+        let mut e = if ix.is_nan() { f64::NAN } else { b.b[ix as usize] };
+        if let Some(an) = &b.anom {
+            e += an.a0 * jsmath::pow(an.rho, jmax(0.0, tau - an.t0));
+        }
+        p.v / (1.0 + jmax(-cap, jmin(cap, e)))
+    }
+
+    /// `v.fcPlace(area)`: each hour is the mean of the newest `placeVintages` vintages that cover it, so one
+    /// vintage's level error can't decide a long job's zone.
+    fn fc_place_for(&mut self, area: &str, hour_start: f64, fc_now: Option<&Vec<f64>>) -> Option<Vec<f64>> {
+        let c = self.fc.get(area)?.clone();
+        let pts: Vec<&Pt> = c.pts.iter().filter(|p| p.t >= hour_start).collect();
+        if !self.fc_log.contains_key(area) || pts.is_empty() {
+            return fc_now.cloned();
+        }
+        let b = Some(self.bias_for(area));
+        let newest = c.vh;
+        let log = self.fc_log.get(area).unwrap();
+        let mut hs: Vec<i64> = log.keys().copied().filter(|h| *h <= newest).collect();
+        hs.sort_by(|a, b| b.cmp(a));
+        hs.truncate(self.o.place_vintages as usize);
+        let vin: Vec<(FxMap<i64, Pt>, i64)> = hs.iter().map(|h| (log[h].iter().map(|p| (p.t as i64, p.clone())).collect(), *h)).collect();
+        Some(
+            pts.iter()
+                .map(|p| {
+                    let (mut sum, mut n) = (0.0f64, 0.0f64);
+                    for (m, h) in &vin {
+                        if let Some(q) = m.get(&(p.t as i64)) {
+                            sum += self.corrected(&b, *h, q);
+                            n += 1.0;
+                        }
+                    }
+                    if n > 0.0 { sum / n } else { self.corrected(&b, newest, p) }
+                })
+                .collect(),
+        )
     }
 
     /// `v.fc(area)`: the published forecast from the current hour on, corrected by this run's learned
@@ -693,20 +957,8 @@ impl Core {
     fn fc_for(&mut self, area: &str, hour_start: f64) -> Option<Vec<f64>> {
         let c = self.fc.get(area)?.clone();
         let b = if self.o.learn_bias { Some(self.bias_for(area)) } else { None };
-        let cap = 2.0 * self.o.bias_cap;
-        let t0 = self.cat.t0;
-        let val = |p: &Pt| -> f64 {
-            let Some(b) = &b else { return p.v };
-            let tau = (p.t - t0) / H;
-            let ix = jmax(0.0, jmin(24.0, jsmath::round(tau - c.vh as f64)));
-            let mut e = if ix.is_nan() { f64::NAN } else { b.b[ix as usize] };
-            if let Some(an) = &b.anom {
-                e += an.a0 * jsmath::pow(an.rho, jmax(0.0, tau - an.t0));
-            }
-            p.v / (1.0 + jmax(-cap, jmin(cap, e)))
-        };
-        let arr: Vec<f64> = c.pts.iter().filter(|p| p.t >= hour_start).map(val).collect();
-        if !arr.is_empty() { Some(arr) } else { Some(vec![val(c.pts.last().unwrap())]) }
+        let arr: Vec<f64> = c.pts.iter().filter(|p| p.t >= hour_start).map(|p| self.corrected(&b, c.vh, p)).collect();
+        if !arr.is_empty() { Some(arr) } else { Some(vec![self.corrected(&b, c.vh, c.pts.last().unwrap())]) }
     }
 
     // ---------- actions ----------
@@ -749,8 +1001,10 @@ impl Core {
         }
         if a.kind == ActKind::Stop {
             // starting is the deadline-safe direction, so only stops are rate-limited
+            // (infoDwell: a start decided before the newest data arrived may be undone at once)
             if let Some(&last) = self.last_toggle.get(&id) {
-                if t_act - last < self.o.min_dwell_h {
+                let newer_data = self.o.info_dwell && self.toggle_ver.get(&id).is_some_and(|v| self.data_ver > *v);
+                if t_act - last < self.o.min_dwell_h && !newer_data {
                     return;
                 }
             }
@@ -768,7 +1022,8 @@ impl Core {
             ActKind::Stop => (false, Some(Verb::Stop)),
             _ => (false, Some(Verb::Start)),
         };
-        let cont = Cont::Vm { delete, verb: v, wl: a.wl.clone(), id: id.clone(), t_act, t_now0, t0: now, why: a.why.clone() };
+        let cont =
+            Cont::Vm { delete, verb: v, wl: a.wl.clone(), id: id.clone(), t_act, t_now0, t0: now, why: a.why.clone(), ver0: self.data_ver };
         match v {
             None => self.call(Call::Remove { zone, id }, cont),
             Some(verb) => self.call(Call::VmAction { zone, id, verb }, cont),
@@ -849,6 +1104,8 @@ impl Core {
 
     /// One iteration of `runLoop`: poll, then decide.
     pub fn loop_tick(&mut self, now: f64) -> Tick {
+        // (the previous sleep is over: `this.wake = null`)
+        self.loop_sleeping = false;
         if self.done {
             return Tick::Done;
         }
@@ -857,12 +1114,16 @@ impl Core {
             self.step(now);
         }
         if self.done {
-            Tick::Done
-        } else if self.finalizing {
-            Tick::Wait
-        } else {
-            Tick::Next(self.o.loop_ms)
+            return Tick::Done;
         }
+        if self.finalizing {
+            return Tick::Wait;
+        }
+        // alignBoundary: sleep only until the next hour boundary (at 720x a 250 ms loop is 0.05 sim h)
+        let ms = if self.o.align_boundary { jmax(2.0, jmin(self.o.loop_ms, self.ms_to_boundary(now) + 2.0)) } else { self.o.loop_ms };
+        self.loop_gen += 1;
+        self.loop_sleeping = self.o.wake_on_data;
+        Tick::Next(ms)
     }
 
     /// One decision step (`step()` in controller.mjs).
@@ -888,8 +1149,8 @@ impl Core {
         let t_now = self.t_now(now).unwrap();
         let lat_h = if state == "RUNNING" { self.lat_h() } else { 0.0 };
         let t_act = t_now + lat_h;
-        self.refresh_forecasts(t_act.floor() as i64);
-        self.refresh_history(t_now.floor() as i64);
+        self.refresh_forecasts(t_act.floor() as i64, now);
+        self.refresh_history(t_now.floor() as i64, now);
         if !self.has_forecasts() {
             return; // wait for the first forecast fill
         }
@@ -917,7 +1178,9 @@ impl Core {
             self.last_hour_logged = hour;
         }
         let margin = self.o.base_margin_h + self.o.latency_margin_x * lat_h;
-        let acts = self.policy.decide(&self.cat, &v, &mut self.memo, margin, lat_h);
+        let speed = self.snap.as_ref().map(|s| s.speed).unwrap_or(720.0);
+        let stall_h = (self.stall_s(now) * (if speed == 0.0 || speed.is_nan() { 720.0 } else { speed })) / 3600.0;
+        let acts = self.policy.decide(&self.cat, &v, &mut self.memo, margin, lat_h, stall_h);
         for a in &acts {
             if matches!(a.kind, ActKind::Create { .. }) {
                 self.fire_create(a, t_act, now);
@@ -927,17 +1190,29 @@ impl Core {
         }
     }
 
-    /// An adoption retry timer fired.
-    pub fn on_timer(&mut self, token: u64) {
-        if let Some(id) = self.timer_conts.remove(&token) {
-            self.adopting.remove(&id);
+    /// A timer fired. Returns true when the loop's sleep is cut short: the driver runs `loop_tick` now
+    /// (a wake-up after new data), and the sleep's own timer is then stale (`loop_gen` moved on).
+    pub fn on_timer(&mut self, token: u64) -> bool {
+        match self.timer_conts.remove(&token) {
+            Some(TimerKind::Adopt(id)) => {
+                self.adopting.remove(&id);
+                false
+            }
+            Some(TimerKind::Wake) => {
+                self.wake_pending = false;
+                if self.loop_sleeping {
+                    self.loop_sleeping = false;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
         }
     }
 
     fn retry_adopt_later(&mut self, id: String) {
-        self.next_id += 1;
-        self.timer_conts.insert(self.next_id, id);
-        self.timers.push((self.next_id, 5000.0));
+        self.timer(TimerKind::Adopt(id), 5000.0);
     }
 
     /// A call returned.
@@ -947,6 +1222,7 @@ impl Core {
             Cont::Status { t0 } => {
                 let t1 = now;
                 self.lat_status = Some(ewma(self.lat_status, t1 - t0));
+                self.lat_sample(false, t1 - t0, now);
                 if let Reply::Status(Some(s)) = reply {
                     if let Some(vt) = s.virtual_time_ms {
                         let speed = if s.speed.is_nan() || s.speed == 0.0 { 720.0 } else { s.speed };
@@ -966,6 +1242,9 @@ impl Core {
                     }
                 }
                 self.status_inflight -= 1;
+                if let Some(i) = self.status_open.iter().position(|x| *x == t0) {
+                    self.status_open.remove(i);
+                }
             }
             Cont::Forecast { area, hour } => {
                 if let Reply::Points(Some(pts)) = reply {
@@ -973,6 +1252,7 @@ impl Core {
                         // vh: the hour the returned vintage starts at (can be hour-1 when asked just past a boundary)
                         let vh = jsmath::round((pts[0].t - self.cat.t0) / H) as i64;
                         let n = pts.len();
+                        let newer = !self.fc.get(&area).is_some_and(|c| c.vh >= vh);
                         if self.o.learn_bias {
                             // (the trace keeps vintage timing only, no grid values: every run shares one
                             // scenario grid, so a kept series would be a view of the next run's future)
@@ -983,9 +1263,13 @@ impl Core {
                             // new evidence → recompute corrections (JS drops every area's cache; the cache
                             // is a pure function of each area's own data, so dropping this area's is the same)
                             self.bias_cache.remove(&area);
+                            self.data_ver += 1;
                         }
                         self.fc.insert(area.clone(), FcEntry { hour, vh, pts });
                         self.fc_view.remove(&area);
+                        if newer {
+                            self.wake_up();
+                        }
                     }
                 }
                 self.fc_inflight.remove(&area);
@@ -1001,6 +1285,18 @@ impl Core {
                         self.hist_hour.insert(area.clone(), hour);
                         self.bias_cache.remove(&area);
                         self.fc_view.remove(&area);
+                        self.data_ver += 1;
+                        let newest = pts.iter().map(|p| p.t).fold(f64::NEG_INFINITY, crate::model::jmax);
+                        let newest_h = jsmath::round((newest - self.cat.t0) / H) as i64;
+                        if !self.hist_newest.get(&area).is_some_and(|x| *x >= newest_h) {
+                            self.wake_up();
+                        }
+                        let prev = self.hist_newest.get(&area).copied().unwrap_or(i64::MIN);
+                        self.hist_newest.insert(area.clone(), prev.max(newest_h));
+                        if self.snap.as_ref().is_some_and(|s| s.state == "RUNNING") {
+                            let lag = 0i64.max(self.t_now(now).unwrap().floor() as i64 - newest_h);
+                            self.hist_lag = Some(self.hist_lag.map_or(lag, |l| l.min(lag)));
+                        }
                         if self.event.is_some() {
                             // publication lag as seen by this run (hours between now and the newest published hour)
                             let newest = pts.iter().map(|p| p.t).fold(f64::NEG_INFINITY, f64::max);
@@ -1018,6 +1314,7 @@ impl Core {
             }
             Cont::Create { wl, zone, prof, name, t_act, t_now0, t0, why } => {
                 self.lat_cloud = Some(ewma(self.lat_cloud, now - t0));
+                self.lat_sample(true, now - t0, now);
                 let Reply::Create(r) = reply else {
                     return self.create_done(None, "bad reply".into(), &wl, &zone, &prof, &name, t_act, t_now0, t0, &why, now);
                 };
@@ -1034,8 +1331,9 @@ impl Core {
                 let id = if let Reply::Found(f) = reply { f } else { None };
                 self.create_done(id, err, &wl, &zone, &prof, &name, t_act, t_now0, t0, &why, now);
             }
-            Cont::Vm { delete, verb, wl, id, t_act, t_now0, t0, why } => {
+            Cont::Vm { delete, verb, wl, id, t_act, t_now0, t0, why, ver0 } => {
                 self.lat_cloud = Some(ewma(self.lat_cloud, now - t0));
+                self.lat_sample(true, now - t0, now);
                 let r = if let Reply::Http(h) = reply { h } else { HttpReply::default() };
                 let tn = self.t_now(now).unwrap_or(t_now0);
                 let vstr = if delete { "delete" } else { verb.unwrap().as_str() };
@@ -1061,6 +1359,7 @@ impl Core {
                             .insert(id.clone(), Override { state: if verb == Verb::Stop { "stopped" } else { "running" }, wall_ack: now });
                         let t = self.t_now(now).unwrap_or(t_act);
                         self.last_toggle.insert(id.clone(), t);
+                        self.toggle_ver.insert(id.clone(), ver0);
                         if verb == Verb::Stop {
                             self.stats.stops += 1;
                         } else {
