@@ -29,6 +29,7 @@ export const CONTROL = {
                          // decided from vintage h-1 that vintage h overturns was held running for most of a dirty hour
   maxLatH: 4,            // cap on the latency used for planning
   latRobust: true,       // planning latency = median of the last 15 calls (not an EWMA a single stall can blow up)
+  rawTracker: false,     // measure compute rates from the engine's reported VM states only (see Tracker.observe)
   learnBias: true,       // learn each area's forecast error by lead time from this run's own published
                          // observations, and correct forecasts before the policy sees them
   biasShrinkN: 24,       // ...shrink a lead's mean error toward 0 with this many pseudo-samples
@@ -275,7 +276,9 @@ export class Controller {
     const receipt = new Map(Object.entries(this.st.vms));
     // in-flight creates count as VMs (quota, and so the policy doesn't create them twice)
     for (const [wl, c] of this.inCreate) for (let i = 0; i < c.left; i++) receipt.set(`pending-${wl}-${i}`, { wl, zone: c.zone, prof: c.prof });
-    const v = buildView(this.cat, status, receipt, this.tracker);
+    // rawTracker: rate samples use the engine's own VM states, not the acknowledged-action overlay
+    const raw = this.o.rawTracker ? new Map((s.workloads ?? []).flatMap((w) => (w.assignments ?? []).map((x) => [x.vm_id, x.state]))) : null;
+    const v = buildView(this.cat, status, receipt, this.tracker, raw);
     v.t = tAct;
     v.memo = this.memo;
     const hourStart = this.cat.T0 + Math.floor(tAct) * H;
