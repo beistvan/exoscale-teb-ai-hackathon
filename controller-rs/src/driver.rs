@@ -77,6 +77,19 @@ fn save_state(path: &Path, st: &RunState, log: &LogFn) {
     }
 }
 
+/// Runs one core entry point; a panic is logged and the loop goes on, like the JS loop's
+/// `try { await this.step() } catch (e) { log }` (a failed step must not leave the run uncontrolled).
+fn guard<T>(log: &LogFn, what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let msg = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+            log(&format!("[{what}] error {msg}"));
+            None
+        }
+    }
+}
+
 /// Executes the core's calls as tasks. In dry mode the writes are answered locally (as the JS
 /// `dryApi` does) and never reach the transport, which would refuse them anyway.
 fn dispatch(core: &mut Core, api: &Arc<LiveApi>, dry: bool, tx: &mpsc::UnboundedSender<(u64, Reply)>, ttx: &mpsc::UnboundedSender<u64>) {
@@ -232,7 +245,9 @@ pub async fn main(opts: Options) -> i32 {
     if opts.destroy {
         core.start_finalize("destroy requested", now_ms());
     }
-    let mut tick = if opts.destroy { Tick::Wait } else { core.loop_tick(now_ms()) };
+    let loop_ms = core.o.loop_ms;
+    let tick_now = |core: &mut Core| guard(&log, "step", || core.loop_tick(now_ms())).unwrap_or(Tick::Next(loop_ms));
+    let mut tick = if opts.destroy { Tick::Wait } else { tick_now(&mut core) };
     loop {
         dispatch(&mut core, &api, false, &tx, &ttx);
         if core.dirty {
@@ -253,11 +268,11 @@ pub async fn main(opts: Options) -> i32 {
         loop {
             tokio::select! {
                 _ = &mut sleep, if wait.is_some() => {
-                    tick = core.loop_tick(now_ms());
+                    tick = tick_now(&mut core);
                     break;
                 }
                 Some((id, r)) = rx.recv() => {
-                    core.on_reply(id, r, now_ms());
+                    guard(&log, "reply", || core.on_reply(id, r, now_ms()));
                     dispatch(&mut core, &api, false, &tx, &ttx);
                     if core.dirty {
                         save_state(&state_path, &core.st, &log);
@@ -267,7 +282,9 @@ pub async fn main(opts: Options) -> i32 {
                         break;
                     }
                 }
-                Some(token) = trx.recv() => core.on_timer(token),
+                Some(token) = trx.recv() => {
+                    guard(&log, "timer", || core.on_timer(token));
+                }
             }
         }
     }
