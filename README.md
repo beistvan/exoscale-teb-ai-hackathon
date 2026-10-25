@@ -4,7 +4,7 @@ Team **zero-reference** · Exoscale GreenOps Challenge, The Energy Bridge Critic
 
 An autonomous controller that completes the challenge's 15 CPU/GPU workloads on the simulated European cloud with as little electricity CO₂ as possible, without missing a deadline or breaking a residency rule. It decides **where** each workload runs (zone, machine, number of workers), **when** it runs or pauses, and **when** its VMs are deleted. It uses only the public catalog and the controlled run's own status, forecasts and published grid observations.
 
-**Best practice run:** `5c35cc4b` — **22 086.0 points**, 12.99 kg CO₂e electricity, 15/15 delivered on time, with the default settings. Earlier: `d84022b1` 22 079.8, `f3f0384c` 22 080.8.
+**Best practice run:** `bac47587` — **22 100.3 points**, 12.93 kg CO₂e electricity, 15/15 delivered on time, with the default settings. Earlier: `5c35cc4b` 22 086.0, `d84022b1` 22 079.8.
 
 Challenge rules and API: [greenops-challenge-starter-kit](https://github.com/exogmi/greenops-challenge-starter-kit) (`docs/RULES.md`, `docs/API.md`).
 
@@ -67,6 +67,10 @@ Practice runs (15/15 delivered on time, 0 API errors each):
 | `e5a54267` | 22 080.2 | 13.02 kg | 720×; fresh forecast vintages, placement averaged over 3 vintages, staged-release gate, 0.1 h stop dwell. Same placements; every job within ±4 g of `d84022b1` (the live API answered in ~15 ms, so vintages were mostly fresh already) |
 | `f085e7d7` | 17 074.8 | 13.00 kg | 720×; + hour-aligned decisions. **w-15 missed its deadline:** the server stalled (calls of 3–5 s, then a 32 s start = 6.5 simulated hours) while w-15 was paused with ~1 h of margin. Led to the stall handling in point 5 |
 | `5c35cc4b` | **22 086.0** | **12.99 kg** | 720×; + stall handling (median latency, stall guard). Same placements; +6 pts from timing |
+| `bac47587` | **22 100.3** | **12.93 kg** | 720×; + harmless pauses: while jobs queue for quota, a pause below the pressure bar is still granted when the projection shows it moves no queued job's start (mock +12.7 pts, 14/16 seeds; live +14.3). The queued jobs wait for the cores w-01, w-02, w-04 and w-07 free; w-03, w-05, w-06, w-14 and w-08 finish far later, so their small pauses block nobody |
+| `cf8a19be`, `db1dba20`, `6b09df1e` | below `5c35cc4b` | | experiments, off by default: picky starts (`pickyFrac` 0.7), a rate floor (`rateFloor` 0.97), a 2 h GPU margin (`gpuMarginCutH` 2). The GPU margin cut moved w-07's finish from t≈67 to t≈76 — its last hours went into forecast-cheap hours that turned out dirtier, as in run 7 — although the mock had it at +22 pts (8/8 seeds) |
+
+Live results for unchanged settings spread by about ±10 pts (timing jitter cascades through the shared quota; the Rust port's notes: 22 061–22 081 for one setting), so a single run can't confirm a change smaller than that. Every create logs its runners-up (`| next: …` with their estimates and rank gap), to show how close each zone/machine choice was.
 
 The four test runs (`4c6e96e2` … `51b1f33d`) all used the current-hour observation from t=0. All four made the Swiss jobs cleaner (w-04: 0.256 → 0.248 kg) and the GPU jobs dirtier (w-09: 4.012 → 4.02–4.07 kg). Pausing the Swiss jobs more precisely made them hold quota longer, which squeezed the other jobs. `d84022b1`'s settings stay the default.
 

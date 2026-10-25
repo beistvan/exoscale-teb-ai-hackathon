@@ -58,6 +58,8 @@ export const DEFAULTS = {
   windowDistMaxDuty: 0.4, // ...only for placements needing at most this share of their window (short jobs, long windows)
   stagedGate: true,    // with prestage: a staged job releasing within the action lead is gated on its release hour
   stallH: 0,           // sim hours a stopped job must keep before its deadline (set by the controller from stallBufferS)
+  harmlessPauses: true,  // gate2: while jobs queue, grant below-bar pauses that move no queued job's projected start
+  harmlessDefers: false, // ...and below-bar deferred starts of fresh jobs
   rateFloor: 0,        // plan with at least this fraction of the catalog speed (0: trust the learned speed fully)
   pickyFrac: 1,        // <1: a fresh job with slack > pickyMinSlackH starts only in this fraction of its gate's clean hours
   pickyMinSlackH: 24, pickyGpuOnly: true,
@@ -515,6 +517,18 @@ export function decide(cat, view, opts = {}) {
       ...deployed.filter((d) => d.pausable && !d.gateRun && d.value > 0 && d.value * wt(d.j.w.id) >= bar(d.it.fp) && !(blocked && o.cleanNoPauseI > 0 && cleanJob(d))).map((d) => ({ kind: "pause", it: d.it, value: d.value * wt(d.j.w.id) })),
       ...fresh.filter((x) => x.pick && !x.gateNow && x.value > 0 && x.value * wt(x.j.w.id) >= bar(x.it.fp)).map((x) => ({ kind: "defer", it: x.it, value: x.value * wt(x.j.w.id) })),
     ].sort((a, b) => b.value - a.value);
+    // harmlessPauses: while jobs queue, a pause below the bar is still granted when the projection shows it moves
+    // no queued job's start — the bar exists to keep quota for them, and this job's quota isn't what they wait for
+    // (run 5c35cc4b: queued jobs took exactly the cores freed by w-01, w-02, w-04, w-07; w-03, w-05, w-06, w-14 and
+    // the 16-vCPU w-08 finished far later, yet their smaller pauses were refused for ~49 hours)
+    if (o.harmlessPauses && blocked) cands.push(...deployed
+      .filter((d) => d.pausable && !d.gateRun && d.value > 0 && !(d.value * wt(d.j.w.id) >= bar(d.it.fp)) && !(o.cleanNoPauseI > 0 && cleanJob(d)))
+      .map((d) => ({ kind: "pause", it: d.it, value: d.value * wt(d.j.w.id), low: true })).sort((a, b) => b.value - a.value));
+    // harmlessDefers: the same for a fresh job the clean-hour rule wants to start later — below the bar it was created
+    // at once, in a dirty hour, though a deferral holds no quota at all
+    if (o.harmlessDefers && blocked) cands.push(...fresh
+      .filter((x) => x.pick && !x.gateNow && x.value > 0 && !(x.value * wt(x.j.w.id) >= bar(x.it.fp)))
+      .map((x) => ({ kind: "defer", it: x.it, value: x.value * wt(x.j.w.id), low: true })).sort((a, b) => b.value - a.value));
     if (o.preempt && blocked) {
       const lateOf = (r, it) => (r.finish.get(it.id) ?? Infinity) - it.due;
       const base0 = new Map(items.map((it) => [it.id, lateOf(baseRun, it)]));
@@ -549,6 +563,7 @@ export function decide(cat, view, opts = {}) {
         // start took 32 s (6.5 sim h at 720x) and w-15, paused with ~1 h of margin, missed its deadline.
         if (ok && o.stallH > 0 && (r.finish.get(c.it.id) ?? Infinity) > (cat.workloads.get(c.it.id).deadline - cat.T0) / H - o.stallH) { ok = false; by = "stall"; }
         if (ok) for (const it of items) if (lateOf(r, it) > Math.max(base0.get(it.id), -cushion) + 1e-6) { ok = false; by = it.id; break; }
+        if (ok && c.low) for (const it of items) if (!it.deployed && it.id !== c.it.id && (r.start.get(it.id) ?? Infinity) > (plan.start.get(it.id) ?? Infinity) + 1e-6) { ok = false; by = `delays ${it.id}`; break; }
         if (!ok && o.trace && c.it.fp.fam !== "cpu") o.trace({ wl: c.it.id, t: +tH.toFixed(2), why: "projection", by, cushion, blocked, value: +c.value.toFixed(2) });
         if (ok) { (c.kind === "pause" ? paused : deferred).add(c.it.id); plan = r; }
         else Object.assign(c.it, saved);
@@ -595,8 +610,12 @@ export function decide(cat, view, opts = {}) {
     // create only what the reservation plan starts now (an earlier-deadline job may own the room)
     if (!x.pick || deferred.has(x.j.w.id) || !((plan.start.get(x.j.w.id) ?? Infinity) <= tH + 1e-6)) continue;
     const p = x.pick;
+    // runners-up (best placement in each other zone / machine), so a run's log shows how close each choice was
+    const seen = new Set([`${p.zone.slug}|${p.prof.label}`]), alts = [];
+    for (const c of x.list) { const key = `${c.zone.slug}|${c.prof.label}`; if (seen.has(key) || c.doomed) continue; seen.add(key); alts.push(c); if (alts.length >= 3) break; }
+    const altTxt = alts.map((c) => `${c.prof.label}x${c.k}@${c.zone.slug} expI=${c.expI.toFixed(0)} est=${c.grams.toFixed(0)}g rank=+${(100 * ((c.rank ?? c.grams) / (p.rank ?? p.grams) - 1)).toFixed(0)}%`).join("; ");
     acts.push({ type: "create", wl: x.j.w.id, zone: p.zone.slug, prof: p.prof.id, k: p.k,
-      why: `${p.prof.label}x${p.k}@${p.zone.slug} need=${p.needH.toFixed(1)}h slack=${p.slackH.toFixed(1)}h expI=${p.expI.toFixed(0)} est=${p.grams.toFixed(0)}g${p.forced ? " FORCED" : ""}${safe ? "" : " deadline-risk"}` });
+      why: `${p.prof.label}x${p.k}@${p.zone.slug} need=${p.needH.toFixed(1)}h slack=${p.slackH.toFixed(1)}h expI=${p.expI.toFixed(0)} est=${p.grams.toFixed(0)}g${p.forced ? " FORCED" : ""}${safe ? "" : " deadline-risk"}${altTxt ? ` | next: ${altTxt}` : ""}` });
   }
 
   // The clock only starts on the first accepted create: with nothing released and nothing
