@@ -11,6 +11,7 @@ use greenops_controller::driver;
 use greenops_controller::live::exo2_auth;
 use greenops_controller::mock::{Engine, Grid, MockEnv};
 use greenops_controller::model::{Catalog, iso_from_ms};
+use greenops_controller::tweaks::{CONTROL_KEYS, Tweaks};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -276,7 +277,8 @@ async fn live_driver_dry_then_full_run_against_a_local_fake_api() {
         state: None,
         catalog: None,
         policy: Default::default(),
-        ctl: Default::default(),
+        // the stall guard counts wall seconds (10 s = 2 h at 720x); scale it to this 40x faster clock
+        ctl: Tweaks::parse(&["stall_base_s=0.25".into(), "stall_buffer_s=0.875".into()], CONTROL_KEYS).unwrap(),
     })
     .await;
     assert_eq!(code, 0);
