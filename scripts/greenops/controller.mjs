@@ -25,8 +25,10 @@ export const CONTROL = {
   statusGapMs: 700,      // min wall gap between status request starts
   baseMarginH: 4,        // deadline margin before latency is added
   latencyMarginX: 2.5,   // + this many "action latencies" (in sim hours) of extra margin
-  minDwellH: 0.6,        // don't toggle the same VM again sooner than this (sim hours)
+  minDwellH: 0.1,        // don't stop the same VM again sooner than this (sim hours). Was 0.6: with fresh vintages a start
+                         // decided from vintage h-1 that vintage h overturns was held running for most of a dirty hour
   maxLatH: 4,            // cap on the latency used for planning
+  latRobust: true,       // planning latency = median of the last 15 calls (not an EWMA a single stall can blow up)
   learnBias: true,       // learn each area's forecast error by lead time from this run's own published
                          // observations, and correct forecasts before the policy sees them
   biasShrinkN: 24,       // ...shrink a lead's mean error toward 0 with this many pseudo-samples
@@ -40,6 +42,22 @@ export const CONTROL = {
                          // fits this run's own forecasts better (leads 0-3). Live runs 6e5310e5/51b1f33d: 0 fits
                          // 4-19 % better from hour 9 on, so 0 is the default
   obsShiftMinN: 24,      // ...once this many comparable forecast/observation pairs exist (until then: 0)
+  freshFc: true,         // fetch each area's forecast until the held vintage is the server's current hour (a fetch
+                         // fired as the action hour begins lands before the server's hour does, so it gets the old one)
+  fcRetryMs: 100,        // ...wall gap between such re-fetches per area (live API answers in ~15 ms)
+                         // (with freshFc, observations are re-fetched the same way until this hour's newest point arrives)
+  placeVintages: 3,      // placement estimates average the newest N forecast vintages (each bias-corrected for its own
+                         // lead): one vintage's level error otherwise decides a 35-46 h job's zone (mock: GPU zone flips)
+  alignBoundary: true,   // sleep only until the next hour boundary (action time or server time), not a whole loop: at 720x
+                         // a 250 ms loop is 0.05 sim h, and live run e5a54267's switches fired 0.047 h after the hour on average
+  wakeOnData: true,      // decide as soon as a newer forecast vintage or observation arrives
+  wakeDebounceMs: 30,    // ...after this short wait, so one hour's burst of replies triggers one decision
+  infoDwell: true,       // inside the stop dwell, still allow a stop when new data arrived since the last toggle
+  stallBufferS: 35,      // wall seconds a paused / not-yet-created job must keep before its deadline while the server shows
+                         // stress (run f085e7d7: 3-5 s calls, then a 32 s start = 6.5 sim h at 720x, and a paused job missed)
+  stallBaseS: 10,        // ...and always (mock: 10 s costs ~1 pt, 25 s ~11 pts, 35 s ~29 pts)
+  stallTriggerMs: 2000,  // stress = a call slower than this, finished or still in flight,
+  stallMemoryS: 60,      // ...within this many wall seconds
 };
 
 export class Controller {
@@ -54,14 +72,17 @@ export class Controller {
     this.st.vms ??= {}; this.st.seq ??= 0; this.st.deleted ??= [];
     this.deleted = new Set(this.st.deleted);
     this.snap = null; this.statusInflight = 0; this.lastStatusStart = -1e15;
-    this.fc = new Map(); this.fcInflight = new Set();
+    this.fc = new Map(); this.fcInflight = new Set(); this.fcAsk = new Map(); this.fcTry = new Map();
     this.fcLog = new Map(); this.obs = new Map(); this.histHour = new Map(); this.histInflight = new Set(); this.biasCache = { hour: -1, b: new Map() };
+    this.histTry = new Map(); this.histNewest = new Map(); this.histLag = null;
     this.dataVer = 0; this.align = { ver: -1, sh: 0, mse: null };
     this.inCreate = new Map(); // wl -> { zone, prof, k, left }
     this.inVm = new Map();     // vmId -> verb in flight
     this.override = new Map(); // vmId -> { state, wallAck, tAck }
     this.lastToggle = new Map(); // vmId -> sim hour of last acknowledged toggle
-    this.lat = { status: null, cloud: null };
+    this.toggleVer = new Map();  // vmId -> dataVer the last toggle was decided with
+    this.wake = null;            // resolves the loop's current sleep early (wakeOnData)
+    this.lat = { status: null, cloud: null }; this.latRecent = {}; this.statusOpen = new Set(); this.lastSlow = null;
     this.tracker = new Tracker();
     this.memo = new Map(); // policy's sticky reservations for waiting jobs
     this.adopting = new Set();
@@ -75,27 +96,40 @@ export class Controller {
     if (this.statusInflight >= this.o.statusConcurrency || now - this.lastStatusStart < this.o.statusGapMs) return;
     this.statusInflight++; this.lastStatusStart = now;
     const t0 = now;
+    this.statusOpen.add(t0);
     this.api.status().then((s) => {
       const t1 = this.clock.now();
-      this.lat.status = ewma(this.lat.status, t1 - t0);
+      this.lat.status = ewma(this.lat.status, t1 - t0); this.latSample("status", t1 - t0);
       if (!s?.virtual_time) return;
       const vt = Date.parse(s.virtual_time);
       const snap = { s, vt, t: (vt - this.cat.T0) / H, wallAt: (t0 + t1) / 2, speed: Number(s.speed_multiplier) || 720, state: String(s.state ?? "").toUpperCase() };
       // freshest wins; READY/PAUSED replies don't advance vt, so prefer the later reply then
       if (!this.snap || snap.vt > this.snap.vt || (snap.vt === this.snap.vt && snap.wallAt >= this.snap.wallAt)) this.snap = snap;
       this.event({ k: "status", latMs: Math.round(t1 - t0), snapH: +snap.t.toFixed(3), state: snap.state, delivered: (s.workloads ?? []).filter((w) => w.final_output_delivered).length });
-    }).catch(() => {}).finally(() => { this.statusInflight--; });
+    }).catch(() => {}).finally(() => { this.statusInflight--; this.statusOpen.delete(t0); });
   }
 
   refreshForecasts(hour) {
+    // freshFc: the server issues one vintage per hour, and `hour` (the action time) runs ahead of the server
+    // clock by the API latency — a fetch fired as `hour` begins mostly returns the previous hour's vintage
+    // (mock: 68 % of planning steps at 0.3 s lag). Re-fetch while the held vintage is older than the
+    // server's hour, so hour h is planned from vintage h-1 by h-1 and corrected by vintage h as soon as it exists.
+    const srvHour = Math.floor(this.tNow() ?? hour), wall = this.clock.now();
     for (const a of new Set([...this.cat.zones.values()].map((z) => z.area))) {
-      if (this.fc.get(a)?.hour === hour || this.fcInflight.has(a)) continue;
+      if (this.fcInflight.has(a)) continue;
+      const held = this.fc.get(a), tr = this.fcTry.get(a);
+      // (at most 4 asks per area per server hour, so a server that issues vintages less often can't be flooded)
+      if (this.o.freshFc ? held && !(held.vh < srvHour && wall - (this.fcAsk.get(a) ?? -1e15) >= this.o.fcRetryMs && !(tr?.hour === srvHour && tr.n >= 4)) : held?.hour === hour) continue;
+      this.fcAsk.set(a, wall);
+      this.fcTry.set(a, { hour: srvHour, n: tr?.hour === srvHour ? tr.n + 1 : 1 });
       this.fcInflight.add(a);
       this.api.forecast(a).then((pts) => {
         if (!pts?.length) return;
         // vh: the hour the returned vintage starts at (can be hour-1 when asked just past a boundary)
         const vh = Math.round((pts[0].t - this.cat.T0) / H);
+        const newer = !(this.fc.get(a)?.vh >= vh);
         this.fc.set(a, { hour, vh, pts });
+        if (newer) this.wakeUp();
         if (this.o.learnBias) { // keep what was forecast at each issue hour, to score it later
           // (the trace keeps vintage timing only, no grid values: every run shares one scenario grid,
           // so a kept series would be a view of the next run's future)
@@ -111,8 +145,18 @@ export class Controller {
   /** Published observations (this run only), fetched once per simulated hour per area. */
   refreshHistory(hour) {
     if (!this.o.learnBias || !this.api.history) return;
+    const wall = this.clock.now();
     for (const a of new Set([...this.cat.zones.values()].map((z) => z.area))) {
-      if (this.histHour.get(a) === hour || this.histInflight.has(a)) continue;
+      if (this.histInflight.has(a)) continue;
+      if (this.histHour.get(a) === hour) {
+        // freshFc: a fetch that reached the server just before its hour turned misses this hour's newest point;
+        // re-ask (spaced, at most 3 times an hour) while it is older than this run's own publication lag implies
+        const m = this.histTry.get(a);
+        if (!this.o.freshFc || this.histLag == null || !((this.histNewest.get(a) ?? -Infinity) < hour - this.histLag)
+          || (m?.hour === hour && (m.n >= 3 || wall - m.ask < this.o.fcRetryMs))) continue;
+      }
+      const m = this.histTry.get(a);
+      this.histTry.set(a, { hour, n: m?.hour === hour ? m.n + 1 : 1, ask: wall });
       this.histInflight.add(a);
       this.api.history(a).then((pts) => {
         if (!pts?.length) return;
@@ -121,6 +165,10 @@ export class Controller {
         this.biasCache = { hour: -1, b: new Map() }; this.dataVer++;
         // publication lag as seen by this run (hours between now and the newest published hour)
         const newest = Math.max(...pts.map((p) => p.t));
+        const newestH = Math.round((newest - this.cat.T0) / H);
+        if (!(this.histNewest.get(a) >= newestH)) this.wakeUp();
+        this.histNewest.set(a, Math.max(this.histNewest.get(a) ?? -Infinity, newestH));
+        if (this.snap?.state === "RUNNING") this.histLag = Math.min(this.histLag ?? Infinity, Math.max(0, Math.floor(this.tNow()) - newestH));
         const bb = this.biasFor(a, hour);
         this.event({ k: "hist", area: a, hour, sh: this.shiftH(), mse: this.align.mse?.map((x) => +x.toFixed(5)), lagH: +(hour - (newest - this.cat.T0) / H).toFixed(2), n: m.size, b0: +bb[0].toFixed(3), b12: +bb[12].toFixed(3), anom: bb.anom ? { rho: +bb.anom.rho.toFixed(2), a0: +bb.anom.a0.toFixed(3), t0: bb.anom.t0 } : null });
       }).catch(() => {}).finally(() => this.histInflight.delete(a));
@@ -192,9 +240,22 @@ export class Controller {
     if (s.state !== "RUNNING") return s.t;
     return s.t + ((this.clock.now() - s.wallAt) * s.speed) / H;
   }
+  latSample(kind, ms) {
+    const a = (this.latRecent[kind] ??= []); a.push(ms); if (a.length > 15) a.shift();
+    if (ms > this.o.stallTriggerMs) this.lastSlow = this.clock.now();
+  }
+  /** Wall seconds of deadline cushion a paused job needs now: more while the server shows stress. */
+  stallS() {
+    const now = this.clock.now();
+    const open = [...this.statusOpen].some((t0) => now - t0 > this.o.stallTriggerMs);
+    return open || now - (this.lastSlow ?? -1e15) < this.o.stallMemoryS * 1000 ? this.o.stallBufferS : this.o.stallBaseS;
+  }
   latH() {
     const s = this.snap;
-    const ms = this.lat.cloud ?? this.lat.status ?? 1000;
+    // latRobust: plan with the median of the last 15 calls — one stalled reply (run f085e7d7: 32 s) otherwise
+    // lifted the EWMA to hours of "latency", switched off every low-lag setting and inflated all margins
+    const med = (a) => (a?.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)] : null);
+    const ms = this.o.latRobust ? (med(this.latRecent.cloud) ?? med(this.latRecent.status) ?? 1000) : (this.lat.cloud ?? this.lat.status ?? 1000);
     return Math.min(this.o.maxLatH, ((ms * (s?.speed ?? 720)) / H));
   }
 
@@ -227,23 +288,43 @@ export class Controller {
       const d = m ? [...m.entries()].filter(([t]) => t - sh < hourStart).sort((a, b) => a[0] - b[0]).slice(-72).map(([, x]) => x) : [];
       distCache.set(area, d); return d;
     };
-    v.fc = (area) => {
-      const c = this.fc.get(area);
-      if (!c) return null;
+    // corrected value of a point from the vintage issued at hour vh (its lead decides the bias applied)
+    const valFor = (area, vh) => {
       const b = this.o.learnBias ? this.biasFor(area, nowHour) : null;
       const cap = 2 * this.o.biasCap;
       const obsNow = this.o.nowcastLead0 ? this.obs.get(area)?.get(hourStart + this.shiftH() * H) : undefined;
-      const val = (p) => {
+      return (p) => {
         if (obsNow > 0 && p.t === hourStart) return obsNow;
         if (!b) return p.v;
         const tau = (p.t - this.cat.T0) / H;
-        let e = b[Math.max(0, Math.min(24, Math.round(tau - (c.vh ?? c.hour))))];
+        let e = b[Math.max(0, Math.min(24, Math.round(tau - vh)))];
         if (b.anom) e += b.anom.a0 * b.anom.rho ** Math.max(0, tau - b.anom.t0);
         return p.v / (1 + Math.max(-cap, Math.min(cap, e)));
       };
+    };
+    v.fc = (area) => {
+      const c = this.fc.get(area);
+      if (!c) return null;
+      const val = valFor(area, c.vh ?? c.hour);
       const arr = c.pts.filter((p) => p.t >= hourStart).map(val);
       return arr.length ? arr : [val(c.pts[c.pts.length - 1])];
     };
+    // placement: each hour is the mean of the newest `placeVintages` vintages that cover it
+    const placeCache = new Map();
+    v.fcPlace = this.o.placeVintages > 1 && this.o.learnBias ? (area) => {
+      if (placeCache.has(area)) return placeCache.get(area);
+      const c = this.fc.get(area), log = this.fcLog.get(area);
+      let out = v.fc(area);
+      const pts = c?.pts.filter((p) => p.t >= hourStart) ?? [];
+      if (log && pts.length) {
+        const newest = c.vh ?? c.hour;
+        const vin = [...log.keys()].filter((h) => h <= newest).sort((a, b) => b - a).slice(0, this.o.placeVintages)
+          .map((h) => ({ m: new Map(log.get(h).map((p) => [p.t, p])), f: valFor(area, h) }));
+        out = pts.map((p) => { let s = 0, n = 0; for (const x of vin) { const q = x.m.get(p.t); if (q) { s += x.f(q); n++; } } return n ? s / n : valFor(area, newest)(p); });
+      }
+      placeCache.set(area, out);
+      return out;
+    } : null;
     return v;
   }
 
@@ -266,7 +347,7 @@ export class Controller {
         let id = null, err = "";
         try {
           const r = await this.api.create(a.zone, p.id, name, a.wl);
-          this.lat.cloud = ewma(this.lat.cloud, this.clock.now() - t0);
+          this.lat.cloud = ewma(this.lat.cloud, this.clock.now() - t0); this.latSample("cloud", this.clock.now() - t0);
           id = r?.id ?? null; err = r?.error ?? "";
           if (!id && r?.ambiguous) id = await this.api.findByName(a.zone, name).catch(() => null);
         } catch (e) { err = String(e); id = await this.api.findByName(a.zone, name).catch(() => null); }
@@ -286,18 +367,19 @@ export class Controller {
     if (this.inVm.has(id) || String(id).startsWith("pending-")) return;
     if (a.type === "stop") { // starting is the deadline-safe direction, so only stops are rate-limited
       const last = this.lastToggle.get(id);
-      if (last != null && tAct - last < this.o.minDwellH) return;
+      // (infoDwell: a start decided before the newest data arrived may be undone at once)
+      if (last != null && tAct - last < this.o.minDwellH && !(this.o.infoDwell && this.dataVer > (this.toggleVer.get(id) ?? Infinity))) return;
     }
     const zone = a.vm.zone ?? this.st.vms[id]?.zone;
     this.inVm.set(id, a.type);
-    const tNow0 = this.tNow() ?? tAct;
+    const tNow0 = this.tNow() ?? tAct, ver0 = this.dataVer;
     this.event({ k: "act", type: a.type, wl: a.wl, vm: id, nowH: +tNow0.toFixed(3), landH: +tAct.toFixed(3), why: a.why });
     const ack = (r, t0) => this.event({ k: "ack", type: a.type, wl: a.wl, vm: id, ok: Boolean(r?.ok || (a.type === "delete" && r?.status === 404)), status: r?.status, latMs: Math.round(this.clock.now() - t0), simH: +((this.tNow() ?? tNow0) - tNow0).toFixed(3) });
     (async () => {
       const t0 = this.clock.now();
       if (a.type === "delete") {
         const r = await this.api.remove(zone, id);
-        this.lat.cloud = ewma(this.lat.cloud, this.clock.now() - t0);
+        this.lat.cloud = ewma(this.lat.cloud, this.clock.now() - t0); this.latSample("cloud", this.clock.now() - t0);
         ack(r, t0);
         if (r.ok || r.status === 404) {
           delete this.st.vms[id]; this.deleted.add(id); this.st.deleted = [...this.deleted]; this.save();
@@ -306,11 +388,11 @@ export class Controller {
         } else { this.stats.errors++; this.log(`[delete] ${a.wl} ${id} → ${r.status} ${String(r.text ?? "").slice(0, 120)}`); }
       } else {
         const r = await this.api.vmAction(zone, id, a.type);
-        this.lat.cloud = ewma(this.lat.cloud, this.clock.now() - t0);
+        this.lat.cloud = ewma(this.lat.cloud, this.clock.now() - t0); this.latSample("cloud", this.clock.now() - t0);
         ack(r, t0);
         if (r.ok) {
           this.override.set(id, { state: a.type === "stop" ? "stopped" : "running", wallAck: this.clock.now() });
-          this.lastToggle.set(id, this.tNow() ?? tAct);
+          this.lastToggle.set(id, this.tNow() ?? tAct); this.toggleVer.set(id, ver0);
           this.stats[a.type === "stop" ? "stops" : "starts"]++;
           this.log(`[${a.type}] ${a.wl} ${id.slice(0, 8)} t≈${tAct.toFixed(1)} (${a.why}) → ok`);
         } else { this.stats.errors++; this.log(`[${a.type}] ${a.wl} ${id.slice(0, 8)} → ${r.status} ${String(r.text ?? "").slice(0, 120)}`); }
@@ -389,11 +471,28 @@ export class Controller {
       const all = v.jobs.flatMap((j) => j.vms);
       this.log(`[t≈${tNow.toFixed(1)}h snap=${snap.t.toFixed(1)}h lat≈${latH.toFixed(2)}h] ${snap.state} delivered ${v.jobs.filter((j) => j.delivered).length}/${v.jobs.length} vms=${v.usage.vms} run=${all.filter((x) => x.state === "running").length} stop=${all.filter((x) => x.state === "stopped").length} cores=${v.usage.cores}`);
     }
-    const acts = this.decideFn(this.cat, v, { ...this.policyOpts, marginMinH: this.o.baseMarginH + this.o.latencyMarginX * latH, latH });
+    const stallH = (this.stallS() * (snap.speed || 720)) / 3600;
+    const acts = this.decideFn(this.cat, v, { ...this.policyOpts, marginMinH: this.o.baseMarginH + this.o.latencyMarginX * latH, latH, stallH });
     for (const a of acts) {
       if (a.type === "create") this.fireCreate(a, tAct);
       else this.fireVm(a, tAct);
     }
+  }
+
+  /** New data arrived: run the next decision soon (debounced, so the hour's burst of replies triggers one step). */
+  wakeUp() {
+    if (!this.o.wakeOnData || this.wakePending) return;
+    this.wakePending = true;
+    this.clock.sleep(this.o.wakeDebounceMs).then(() => { this.wakePending = false; const w = this.wake; this.wake = null; w?.(); });
+  }
+
+  /** Wall ms until the action time or the server clock reaches its next hour (Infinity unless running). */
+  msToBoundary() {
+    const s = this.snap;
+    if (!s || s.state !== "RUNNING") return Infinity;
+    const tNow = this.tNow(), tAct = tNow + this.latH();
+    const dH = Math.min(Math.ceil(tAct + 1e-9) - tAct, Math.ceil(tNow + 1e-9) - tNow);
+    return (dH * H) / s.speed;
   }
 
   async runLoop() {
@@ -403,7 +502,10 @@ export class Controller {
         try { await this.step(); } catch (e) { this.log(`[step] error ${e?.stack ?? e}`); }
       }
       if (this.done) break;
-      await this.clock.sleep(this.o.loopMs);
+      const ms = this.o.alignBoundary ? Math.max(2, Math.min(this.o.loopMs, this.msToBoundary() + 2)) : this.o.loopMs;
+      if (this.o.wakeOnData) await Promise.race([this.clock.sleep(ms), new Promise((r) => { this.wake = r; })]);
+      else await this.clock.sleep(ms);
+      this.wake = null;
     }
     return this.stats;
   }
