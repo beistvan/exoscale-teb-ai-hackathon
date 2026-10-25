@@ -31,7 +31,7 @@ export const DEFAULTS = {
   prestage: false,     // create VMs boot+input ahead of release so staging is done when the job releases
   horizonPenalty: 0,   // forecast-risk penalty for waiting on far-off cheap hours (see risk())
   hourlyGate: false,   // decide each job's run/pause once per forecast hour (no mid-hour flapping)
-  cleanNoPauseI: 0,    // gate2: jobs whose zone averages below this (gCO2e/kWh x PUE) don't pause while others queue
+  cleanNoPauseI: 30,   // gate2: jobs whose zone averages below this (gCO2e/kWh x PUE) don't pause while others queue
   dynamicBar: false,   // gate2: while jobs queue, a pause must save more than the delay costs them
   dynX: 1,             // ...scale on that opportunity cost
   reserveSingle: true, // reserve waiting multi-worker jobs as one worker in the projection (mock: +10..+31 pts, 0 misses)
@@ -59,24 +59,24 @@ export const DEFAULTS = {
   stagedGate: true,    // with prestage: a staged job releasing within the action lead is gated on its release hour
   stallH: 0,           // sim hours a stopped job must keep before its deadline (set by the controller from stallBufferS)
   extPremium: 0,       // >0: price the window beyond the forecast (same-hour/mean blend + this premium) in the gate
-  runFrac: 1,          // <1: running jobs use only this fraction of their proportional share of the visible cheap hours
+  runFrac: 0.9,        // <1: running jobs use only this fraction of their proportional share of the visible cheap hours
   extPremiumGpuOnly: false, // ...for GPU jobs only (live: postponing hurt GPU jobs, run 7 / 6b09df1e; a thinner CPU margin helped)
   missedOnServerTime: true, // "deadline passed" deletes use the server's snapshot time (false: the extrapolated time, as before)
   harmlessPauses: true,  // gate2: while jobs queue, grant below-bar pauses that move no queued job's projected start
   harmlessDefers: false, // ...and below-bar deferred starts of fresh jobs
   handOver: false,     // gate2: a slot held by a fresh job that defers its start goes to the next queued job ready to run
-  yieldFlat: false,    // gate2: CPU jobs whose forecast pays back little for a long window wait (no VM) until slack = yieldSlackH
+  yieldFlat: true,     // gate2: CPU jobs whose forecast pays back little for a long window wait (no VM) until slack = yieldSlackH
   yieldFvMax: 0.05, yieldSlackH: 24,
   rateFloor: 0,        // plan with at least this fraction of the catalog speed (0: trust the learned speed fully)
-  pickyFrac: 1,        // <1: a fresh job with slack > pickyMinSlackH starts only in this fraction of its gate's clean hours
+  pickyFrac: 0.85,     // <1: a fresh job with slack > pickyMinSlackH starts only in this fraction of its gate's clean hours
   pickyMinSlackH: 24, pickyGpuOnly: true,
   pauseOutput: false,  // allow pausing during the final output phase (it otherwise always runs)
   llf: false,          // reserve queued jobs least-laxity-first (due - need) instead of earliest-due-first
   gpuTightW: 0,        // GPU placements needing more than gpuTightAt of their window are penalised by this per unit
   gpuTightAt: 0.6,
   scarcityW: 0.25,     // ranking penalty per full share of the vCPU / GPU-family quota a placement takes
-  cleanZoneSmallVm: 0, // grams added per vCPU held, for CPU placements in zones cleaner than cleanZoneMaxI
-  cleanZoneMaxI: 90,   // (forecast mean x PUE, gCO2e/kWh) — favours 16-vCPU VMs for jobs on very clean grids
+  cleanZoneSmallVm: 0.2, // grams added per vCPU held, for CPU placements in zones cleaner than cleanZoneMaxI
+  cleanZoneMaxI: 80,   // (forecast mean x PUE, gCO2e/kWh) — favours 16-vCPU VMs for jobs on very clean grids
   scarcityMode: "cores", // "cores" (share held at once) | "coreHours" (share x time held) | "gpuCoreHours" (GPU only)
   cardW: 1,            // weight of the GPU-card share in the scarcity penalty
   stickyTol: 0.15,     // keep a waiting job's reserved placement unless another ranks >15% better
@@ -88,10 +88,11 @@ export const DEFAULTS = {
   pressure: true,      // "gate" mode only: one job class runs flat-out while a released job waits for quota
   pressureTarget: "cpu", // ...which class: "cpu" | "gpu" | "none"
   pointsAware: true,   // gate2: rank pauses by points saved (score formula), not grams
-  pressureValuePerCore: 0.15, // gate2: g/h saved per held vCPU a pause needs while another job waits for quota
+  pressureValuePerCore: 0.25, // gate2: g/h saved per held vCPU a pause needs while another job waits for quota
   strictPauses: true,  // gate2: re-check every pause against the projection even when it looks safe
   queueCushionH: 4,    // gate2: while a job waits for quota, pauses must leave every job this many hours of slack
   replaceForeign: true, // replace a VM we didn't create (e.g. the starter demo's) before it does real work...
+  cleanNoPauseI: 30,   // favour keeping jobs running on very clean grids, but still pause aggressively on dirtier hours
   replaceMinRel: 0.15, // ...when our placement is estimated at least 15% cleaner
   replaceMinG: 100,    // ...and saves at least this many grams
 };
