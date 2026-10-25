@@ -63,6 +63,12 @@ pub struct ControlOpts {
     pub stall_memory_s: f64,
     /// measure compute rates from the engine's reported VM states only (see Tracker::observe)
     pub raw_tracker: bool,
+    /// never extrapolate the simulated clock more than this past the freshest status reply (ms)
+    pub max_extrap_ms: f64,
+    /// after this many failed decision steps in a row, start every stopped VM of unfinished work
+    pub safe_mode_errors: f64,
+    /// a loop gap longer than this (ms) = this process was frozen; wait for a status requested after it
+    pub freeze_ms: f64,
     /// cap on the latency used for planning (sim hours)
     pub max_lat_h: f64,
     /// learn each area's forecast error by lead time from this run's own published observations
@@ -100,6 +106,9 @@ impl ControlOpts {
                 "stall_trigger_ms" => self.stall_trigger_ms = v,
                 "stall_memory_s" => self.stall_memory_s = v,
                 "raw_tracker" => self.raw_tracker = v != 0.0,
+                "max_extrap_ms" => self.max_extrap_ms = v,
+                "safe_mode_errors" => self.safe_mode_errors = v,
+                "freeze_ms" => self.freeze_ms = v,
                 "max_lat_h" => self.max_lat_h = v,
                 "learn_bias" => self.learn_bias = v != 0.0,
                 "bias_shrink_n" => self.bias_shrink_n = v,
@@ -137,6 +146,9 @@ impl Default for ControlOpts {
             stall_trigger_ms: 2000.0,
             stall_memory_s: 60.0,
             raw_tracker: false,
+            max_extrap_ms: 10000.0,
+            safe_mode_errors: 8.0,
+            freeze_ms: 5000.0,
             max_lat_h: 4.0,
             learn_bias: true,
             bias_shrink_n: 24.0,
@@ -294,6 +306,8 @@ pub struct Snap {
     pub vt: f64,
     pub t: f64,
     pub wall_at: f64,
+    /// wall time the status request was sent
+    pub req_at: f64,
     pub speed: f64,
     pub state: String,
 }
@@ -480,6 +494,10 @@ pub struct Core {
     loop_sleeping: bool,
     /// generation of the loop's current sleep (a sleep cut short leaves a stale timer behind)
     pub loop_gen: u64,
+    last_loop_wall: Option<f64>,
+    freeze_at: Option<f64>,
+    /// failed decision steps in a row (the driver counts them; safe mode starts stopped work)
+    pub step_errors: u32,
     log: Option<LogFn>,
     event: Option<EventFn>,
 }
@@ -544,6 +562,9 @@ impl Core {
             wake_pending: false,
             loop_sleeping: false,
             loop_gen: 0,
+            last_loop_wall: None,
+            freeze_at: None,
+            step_errors: 0,
             log: None,
             event: None,
         }
@@ -806,7 +827,9 @@ impl Core {
         if s.state != "RUNNING" {
             return Some(s.t);
         }
-        Some(s.t + ((now - s.wall_at) * s.speed) / H)
+        // at most max_extrap_ms past the freshest reply, so a local clock jump or a long freeze can't run the
+        // estimate ahead of the server
+        Some(s.t + (jmax(0.0, jmin(now - s.wall_at, self.o.max_extrap_ms)) * s.speed) / H)
     }
 
     pub fn lat_h(&self) -> f64 {
@@ -878,6 +901,7 @@ impl Core {
             None
         };
         let mut v = build_view(&self.cat, &snap.s, &overlay, &receipt, &mut self.tracker, raw.as_ref());
+        v.t_snap = Some(v.t); // the server's own time at this snapshot
         v.t = t_act;
         let now_hour = t_act.floor();
         let hour_start = self.cat.t0 + now_hour * H;
@@ -1119,8 +1143,19 @@ impl Core {
         if self.done {
             return Tick::Done;
         }
+        // a loop iteration that took far longer than planned means this process was frozen: act again only
+        // on a status reply requested after the freeze
+        if let Some(last) = self.last_loop_wall {
+            if now - last > self.o.freeze_ms {
+                self.freeze_at = Some(now);
+                let gap = (now - last) / 1000.0;
+                self.log(|| format!("[freeze] no loop for {gap:.1} s — waiting for a fresh status before acting"));
+            }
+        }
+        self.last_loop_wall = Some(now);
         self.poll_status(now);
-        if self.snap.is_some() && !self.finalizing {
+        let frozen = matches!((self.freeze_at, self.snap.as_ref()), (Some(f), Some(s)) if s.req_at < f);
+        if self.snap.is_some() && !self.finalizing && !frozen {
             self.step(now);
         }
         if self.done {
@@ -1200,6 +1235,34 @@ impl Core {
         }
     }
 
+    /// Safe mode (decisions keep failing): start every stopped VM of unfinished work, delete delivered work's VMs.
+    pub fn safe_mode(&mut self, now: f64) {
+        let Some(snap) = self.snap.clone() else { return };
+        let t = self.t_now(now).unwrap_or(0.0);
+        let mut n = 0;
+        for w in &snap.s.workloads {
+            for a in &w.assignments {
+                if self.deleted.contains(&a.vm_id) {
+                    continue;
+                }
+                let vm =
+                    crate::policy::VmView { id: a.vm_id.clone(), zone: a.zone.clone(), prof: None, state: a.state.clone(), adopted: false };
+                if w.delivered {
+                    let act = Action { kind: ActKind::Delete, wl: w.id.clone(), vm: Some(vm), why: "safe mode: delivered".into() };
+                    self.fire_vm(&act, t, now);
+                } else if a.state == "stopped" {
+                    let act = Action { kind: ActKind::Start, wl: w.id.clone(), vm: Some(vm), why: "safe mode: decisions failing".into() };
+                    self.fire_vm(&act, t, now);
+                    n += 1;
+                }
+            }
+        }
+        if n > 0 {
+            let e = self.step_errors;
+            self.log(|| format!("[safe] {e} failed steps in a row: starting {n} stopped VM(s)"));
+        }
+    }
+
     /// A timer fired. Returns true when the loop's sleep is cut short: the driver runs `loop_tick` now
     /// (a wake-up after new data), and the sleep's own timer is then stale (`loop_gen` moved on).
     pub fn on_timer(&mut self, token: u64) -> bool {
@@ -1238,7 +1301,8 @@ impl Core {
                         let speed = if s.speed.is_nan() || s.speed == 0.0 { 720.0 } else { s.speed };
                         let state = s.state.to_uppercase();
                         let delivered = s.workloads.iter().filter(|w| w.delivered).count();
-                        let snap = Snap { vt, t: (vt - self.cat.t0) / H, wall_at: (t0 + t1) / 2.0, speed, state: state.clone(), s };
+                        let snap =
+                            Snap { vt, t: (vt - self.cat.t0) / H, wall_at: (t0 + t1) / 2.0, req_at: t0, speed, state: state.clone(), s };
                         // freshest wins; READY/PAUSED replies don't advance vt, so prefer the later reply then
                         let take = match &self.snap {
                             None => true,

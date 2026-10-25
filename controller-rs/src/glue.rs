@@ -214,6 +214,7 @@ pub fn build_view(
         .collect();
     View {
         t,
+        t_snap: None,
         state: status.state.to_uppercase(),
         usage,
         jobs,

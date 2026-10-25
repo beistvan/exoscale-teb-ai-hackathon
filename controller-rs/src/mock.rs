@@ -54,6 +54,8 @@ pub struct MockEnv {
     /// MOCK_STALL="h,ms[,rampS]": from sim hour h ("r": random in 60-115) every request is held ms of wall time,
     /// after rampS seconds of 3-5 s replies (a live server stall)
     pub stall: Option<(Option<f64>, f64, f64)>,
+    /// MOCK_FLAT="FR,CH": these areas get an almost flat grid (3 % daily swing, no day drift)
+    pub flat: Vec<String>,
 }
 
 impl Default for MockEnv {
@@ -73,6 +75,7 @@ impl Default for MockEnv {
             quota_big: false,
             cores: None,
             stall: None,
+            flat: vec![],
         }
     }
 }
@@ -115,6 +118,9 @@ impl MockEnv {
         e.fc_perfect = num("MOCK_FC_PERFECT", 0.0);
         e.quota_big = var("MOCK_QUOTA").as_deref() == Some("big");
         e.cores = var("MOCK_CORES").map(|v| crate::model::js_number(Some(&serde_json::Value::String(v))));
+        if let Some(f) = var("MOCK_FLAT") {
+            e.flat = f.split(',').filter(|x| !x.is_empty()).map(str::to_owned).collect();
+        }
         if let Some(st) = var("MOCK_STALL") {
             let p: Vec<&str> = st.split(',').collect();
             let n = |x: Option<&&str>| x.map(|v| crate::model::js_number(Some(&serde_json::Value::String(v.to_string())))).unwrap_or(0.0);
@@ -193,8 +199,14 @@ impl Grid {
                         None => jmax(0.6, jmin(1.5, drift * (1.0 + 0.18 * gauss(&mut r)))),
                     };
                 }
+                // (the random draws are consumed as usual, so a flat area leaves every other series unchanged)
+                let flat = env.flat.iter().any(|x| x == a);
+                let nz = gauss(&mut r);
                 let c = jsmath::cos((2.0 * std::f64::consts::PI * (h as f64 - pk)) / 24.0);
-                let v = m * drift * (1.0 + amp * c) * (1.0 + 0.05 * gauss(&mut r));
+                let v = m
+                    * (if flat { 1.0 } else { drift })
+                    * (1.0 + (if flat { 0.03 } else { amp }) * c)
+                    * (1.0 + (if flat { 0.01 } else { 0.05 }) * nz);
                 arr.push(jmax(5.0, v));
             }
             actual.push(arr);

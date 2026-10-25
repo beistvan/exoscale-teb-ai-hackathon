@@ -64,6 +64,27 @@ pub struct Opts {
     pub picky_gpu_only: bool,
     /// plan with at least this fraction of the catalog speed (0: trust the learned speed fully)
     pub rate_floor: f64,
+    /// while jobs queue, jobs whose zone averages below this (gCO2e/kWh x PUE) don't pause
+    pub clean_no_pause_i: f64,
+    /// grams added per vCPU held for CPU placements in zones cleaner than clean_zone_max_i
+    pub clean_zone_small_vm: f64,
+    pub clean_zone_max_i: f64,
+    /// (experiment) a smaller low-lag deadline-margin cut for GPU jobs too
+    pub gpu_margin_cut_h: f64,
+    /// >0: price the window beyond the forecast in the gate (same-hour/mean blend + this premium)
+    pub ext_premium: f64,
+    pub ext_premium_gpu_only: bool,
+    /// running jobs use only this fraction of their proportional share of the visible cheap hours
+    pub run_frac: f64,
+    /// "deadline passed" deletes use the server's snapshot time
+    pub missed_on_server_time: bool,
+    /// while jobs queue, grant below-bar pauses that move no queued job's projected start
+    pub harmless_pauses: bool,
+    pub harmless_defers: bool,
+    /// CPU jobs whose forecast pays back little for a long window wait (no VM) until slack = yield_slack_h
+    pub yield_flat: bool,
+    pub yield_fv_max: f64,
+    pub yield_slack_h: f64,
 }
 
 impl Opts {
@@ -101,7 +122,7 @@ impl Opts {
             sticky_tol: 0.15,
             cpu_pause_max_lat_h: 1.5,
             points_aware: true,
-            pressure_value_per_core: 0.15,
+            pressure_value_per_core: 0.25,
             queue_cushion_h: 4.0,
             replace_foreign: true,
             replace_min_rel: 0.15,
@@ -109,10 +130,23 @@ impl Opts {
             margin_frac_gpu: None,
             staged_gate: true,
             stall_h: 0.0,
-            picky_frac: 1.0,
+            picky_frac: 0.85,
             picky_min_slack_h: 24.0,
             picky_gpu_only: true,
             rate_floor: 0.0,
+            clean_no_pause_i: 30.0,
+            clean_zone_small_vm: 0.2,
+            clean_zone_max_i: 80.0,
+            gpu_margin_cut_h: 0.0,
+            ext_premium: 0.0,
+            ext_premium_gpu_only: false,
+            run_frac: 0.9,
+            missed_on_server_time: true,
+            harmless_pauses: true,
+            harmless_defers: false,
+            yield_flat: true,
+            yield_fv_max: 0.05,
+            yield_slack_h: 24.0,
         };
         if !tw.is_empty() {
             let b = |v: f64| v != 0.0;
@@ -151,6 +185,19 @@ impl Opts {
                     "picky_min_slack_h" => o.picky_min_slack_h = v,
                     "picky_gpu_only" => o.picky_gpu_only = b(v),
                     "rate_floor" => o.rate_floor = v,
+                    "clean_no_pause_i" => o.clean_no_pause_i = v,
+                    "clean_zone_small_vm" => o.clean_zone_small_vm = v,
+                    "clean_zone_max_i" => o.clean_zone_max_i = v,
+                    "gpu_margin_cut_h" => o.gpu_margin_cut_h = v,
+                    "ext_premium" => o.ext_premium = v,
+                    "ext_premium_gpu_only" => o.ext_premium_gpu_only = b(v),
+                    "run_frac" => o.run_frac = v,
+                    "missed_on_server_time" => o.missed_on_server_time = b(v),
+                    "harmless_pauses" => o.harmless_pauses = b(v),
+                    "harmless_defers" => o.harmless_defers = b(v),
+                    "yield_flat" => o.yield_flat = b(v),
+                    "yield_fv_max" => o.yield_fv_max = v,
+                    "yield_slack_h" => o.yield_slack_h = v,
                     _ => {}
                 }
             }
@@ -163,7 +210,7 @@ impl Opts {
             o.pressure_value_per_core = tw.get("low.pressure_value_per_core").unwrap_or(0.08);
             o.prestage = tw.get("low.prestage").map(|v| v != 0.0).unwrap_or(true);
             if margin_cut_h > 0.0 {
-                o.margin_min_h_gpu = Some(margin_min_h);
+                o.margin_min_h_gpu = Some(jmax(low_lat_margin_min_h, margin_min_h - o.gpu_margin_cut_h));
                 o.margin_min_h = jmax(low_lat_margin_min_h, margin_min_h - margin_cut_h);
             }
         }
@@ -210,6 +257,8 @@ pub struct JobView {
 pub struct View {
     /// sim hours since T0 at which the actions will land
     pub t: f64,
+    /// the server's own time at this snapshot (deadline-passed deletes rely on it)
+    pub t_snap: Option<f64>,
     pub state: String,
     pub usage: Usage,
     pub jobs: Vec<JobView>,
@@ -335,6 +384,8 @@ struct Deployed {
     value: f64,
     est_g: f64,
     why: String,
+    /// zone index of the job's VM
+    zone: usize,
 }
 
 struct Fresh {
@@ -345,6 +396,8 @@ struct Fresh {
     gate_now: bool,
     value: f64,
     list: Vec<Placement>,
+    /// yieldFlat: wait without a VM until this sim hour
+    yield_at: Option<f64>,
 }
 
 /// One area's corrected forecast with every prefix fc[..W] pre-sorted (and its running sums in
@@ -398,12 +451,6 @@ impl Win {
         }
         Some(self.sorted[w][n as usize - 1])
     }
-    /// `withinNoise()`'s window: W hours, run in the n cheapest.
-    fn window(&self, need_h: f64, avail_h: f64) -> (usize, f64) {
-        let w = jmax(1.0, jmin(self.len() as f64, avail_h.floor()));
-        let n = jmin(w, ((w * need_h) / avail_h + 1e-9).ceil());
-        (if w.is_nan() { 0 } else { w as usize }, n)
-    }
     /// `gate()` / `hourSaving()`'s window: as above, at least 1 hour, and only the cheapest `frac` of
     /// them (`pickyFrac`; 1 = all).
     fn window_frac(&self, need_h: f64, avail_h: f64, frac: f64) -> (usize, f64) {
@@ -413,41 +460,61 @@ impl Win {
     }
 }
 
+/// The forecast value the clean-hour rule compares the current hour with: the n-th cheapest of the visible
+/// window (n = ceil(frac x W x need / avail), at least 1). extPremium (ep > 0, frac == 1): the hours beyond the
+/// forecast are priced too, each as 50 % the same hour of day in the forecast and 50 % its mean, plus ep.
+fn threshold(fc: &Win, need_h: f64, avail_h: f64, frac: f64, gpu: bool, ep: f64, ep_gpu_only: bool) -> Option<f64> {
+    if ep > 0.0 && (gpu || !ep_gpu_only) && avail_h > fc.len() as f64 + 1.0 && frac == 1.0 {
+        let w = jmax(1.0, jmin(fc.len() as f64, avail_h.floor())) as usize;
+        let mean = fc.fc.iter().fold(0.0, |a, b| a + b) / fc.len() as f64;
+        let u = (avail_h.floor() as usize).saturating_sub(fc.len());
+        let mut all: Vec<f64> = fc.fc[..w].to_vec();
+        for k in 0..u {
+            all.push((1.0 + ep) * (0.5 * fc.fc[k % fc.len()] + 0.5 * mean));
+        }
+        crate::model::sort_num(&mut all);
+        let i = jmin(all.len() as f64, jmax(1.0, need_h.ceil())) as usize;
+        return all.get(i.wrapping_sub(1)).copied();
+    }
+    let (w, n) = fc.window_frac(need_h, avail_h, frac);
+    fc.nth(w, n)
+}
+
+#[derive(Clone, Copy)]
+struct Ep(f64, bool);
+
 /// Proportional rule: within the visible window, run in the cheapest ceil(W*need/avail) hours
 /// (frac < 1: only the cheapest frac of those — a pickier start).
-fn gate(fc: &Win, need_h: f64, avail_h: f64, frac: f64) -> bool {
+fn gate(fc: &Win, need_h: f64, avail_h: f64, frac: f64, gpu: bool, ep: Ep) -> bool {
     if need_h <= 0.0 {
         return true;
     }
     if fc.is_empty() || need_h >= avail_h - 0.25 {
         return true;
     }
-    let (w, n) = fc.window_frac(need_h, avail_h, frac);
-    match fc.nth(w, n) {
+    match threshold(fc, need_h, avail_h, frac, gpu, ep.0, ep.1) {
         Some(thr) => fc.fc[0] <= thr + 1e-9,
         None => false, // JS: fc[0] <= undefined + 1e-9 is false
     }
 }
 
 /// True when waiting would save less than `band` (relative) — i.e. within forecast noise.
-fn within_noise(fc: &Win, need_h: f64, avail_h: f64, band: f64) -> bool {
+fn within_noise(fc: &Win, need_h: f64, avail_h: f64, band: f64, gpu: bool, ep: Ep) -> bool {
     if !(band > 0.0) || fc.is_empty() || need_h >= avail_h - 0.25 {
         return false;
     }
-    let (w, n) = fc.window(need_h, avail_h);
-    match fc.nth(w, n) {
+    match threshold(fc, need_h, avail_h, 1.0, gpu, ep.0, ep.1) {
         Some(thr) => fc.fc[0] - thr < band * jmax(1.0, thr),
         None => false,
     }
 }
 
 /// gCO2e/kWh saved by moving the current hour of work to the hour the gate would use instead.
-fn hour_saving(fc: &Win, need_h: f64, avail_h: f64, frac: f64) -> f64 {
+fn hour_saving(fc: &Win, need_h: f64, avail_h: f64, frac: f64, gpu: bool, ep: Ep) -> f64 {
     if fc.is_empty() || need_h >= avail_h - 0.25 {
         return 0.0;
     }
-    let (w, n) = fc.window_frac(need_h, avail_h, frac);
-    match fc.nth(w, n) {
+    match threshold(fc, need_h, avail_h, frac, gpu, ep.0, ep.1) {
         Some(thr) => jmax(0.0, fc.fc[0] - thr),
         None => f64::NAN,
     }
@@ -599,6 +666,30 @@ impl Policy {
             let cb = cat.profiles[b.prof].cores * b.k;
             (ca - cb).partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
         });
+        // quota opportunity cost is not proportional to a job's own carbon: in a very clean zone a small VM
+        // costs a few grams but frees quota that dirtier jobs use to dodge their dirty hours
+        if o.clean_zone_small_vm > 0.0 {
+            for c in scored.iter_mut() {
+                let p = &cat.profiles[c.prof];
+                if !p.is_cpu {
+                    continue;
+                }
+                let f = self.win(c.zone);
+                let mean = if f.is_empty() { f64::INFINITY } else { f.fc.iter().fold(0.0, |a, b| a + b) / f.len() as f64 };
+                if mean * cat.zones[c.zone].pue < o.clean_zone_max_i {
+                    c.rank = Some(c.key() + o.clean_zone_small_vm * p.cores * c.k);
+                }
+            }
+            scored.sort_by(|a, b| {
+                let d = a.key() - b.key();
+                if d != 0.0 && !d.is_nan() {
+                    return d.partial_cmp(&0.0).unwrap();
+                }
+                let ca = cat.profiles[a.prof].cores * a.k;
+                let cb = cat.profiles[b.prof].cores * b.k;
+                (ca - cb).partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         // sticky: a job already holding a reservation keeps that placement unless another is clearly better
         if let Some(m) = memo.get(&w.id) {
             if let Some(i) = scored.iter().position(|c| cat.zones[c.zone].slug == m.zone && cat.profiles[c.prof].id == m.prof && c.k == m.k)
@@ -793,6 +884,7 @@ impl Policy {
     ) -> Vec<Action> {
         let mut o = Opts::resolve_with(margin_min_h, lat_h, &self.tweaks);
         o.stall_h = stall_h;
+        let ep = Ep(o.ext_premium, o.ext_premium_gpu_only);
         if self.wins.len() != view.fc.len() {
             self.wins = view.fc.iter().map(|_| Win::new(&[])).collect();
             self.win_ver = vec![u64::MAX; view.fc.len()];
@@ -838,7 +930,10 @@ impl Policy {
             }
         }
         // past its deadline: work no longer counts but electricity does — free the VMs, stop planning it
-        let missed = |j: &JobView| !j.delivered && (j.state.to_lowercase() == "deadline_missed" || t_h > deadline_h(j) + 0.25);
+        // deadline passed: only on the server's word — its snapshot time or the workload state, never the
+        // extrapolated action time (a clock jump once deleted every running job as "deadline passed")
+        let t_missed = if o.missed_on_server_time { view.t_snap.unwrap_or(t_h) } else { t_h };
+        let missed = |j: &JobView| !j.delivered && (j.state.to_lowercase() == "deadline_missed" || t_missed > deadline_h(j) + 0.25);
         for j in &view.jobs {
             if missed(j) {
                 for vm in &j.vms {
@@ -959,15 +1054,24 @@ impl Policy {
             let since_h = t_h - j.deployed_h.unwrap_or(t_h);
             let avail_h = (if prof.is_cpu { jmin(due - t_h, jmax(run_need, o.cpu_window_h - since_h)) } else { due - t_h })
                 - (if near_rel { wait } else { 0.0 });
-            let gate_run = !pausable || gate(fc, run_need, avail_h, 1.0) || within_noise(fc, run_need, avail_h, o.noise_band);
-            let value =
-                if pausable && !gate_run { ((prof.watts * k) / 1000.0) * zone.pue * hour_saving(fc, run_need, avail_h, 1.0) } else { 0.0 };
+            // runFrac < 1: a running job keeps to the cheapest runFrac of its proportional share of the visible
+            // hours, i.e. waits a little more for later cheap hours
+            let is_gpu = !prof.is_cpu;
+            let rf = o.run_frac;
+            let gate_run = !pausable
+                || gate(fc, run_need, avail_h, rf, is_gpu, ep)
+                || (rf == 1.0 && within_noise(fc, run_need, avail_h, o.noise_band, is_gpu, ep));
+            let value = if pausable && !gate_run {
+                ((prof.watts * k) / 1000.0) * zone.pue * hour_saving(fc, run_need, avail_h, rf, is_gpu, ep)
+            } else {
+                0.0
+            };
             let fc_mean = if !fc.is_empty() { fc.fc.iter().fold(0.0, |a, b| a + b) / fc.len() as f64 } else { 0.0 };
             let est_g =
                 ((prof.watts * k) / 1000.0) * (setup_h(w, prof) + w.required / rate_k(w, prof, k) + output_h(w)) * zone.pue * fc_mean;
             let why = format!("need={:.1}h avail={:.1}h", run_need, due - t_h);
             items.push(item);
-            deployed.push(Deployed { job: ji, item: items.len() - 1, pausable, gate_run, value, est_g, why });
+            deployed.push(Deployed { job: ji, item: items.len() - 1, pausable, gate_run, value, est_g, why, zone: zi });
         }
         let base = Usage {
             vms: jmax(0.0, view.usage.vms - held_open.vms),
@@ -1058,19 +1162,32 @@ impl Policy {
             let gate_now = use_.forced
                 || pick.is_none()
                 || (!cpu_pause && up.is_cpu)
-                || gate(fc, use_.need_h, win, fr)
-                || (fr == 1.0 && within_noise(fc, use_.need_h, win, o.noise_band));
+                || gate(fc, use_.need_h, win, fr, !up.is_cpu, ep)
+                || (fr == 1.0 && within_noise(fc, use_.need_h, win, o.noise_band, !up.is_cpu, ep));
             let value = if pick.is_some() && !gate_now {
-                ((up.watts * use_.k) / 1000.0) * cat.zones[use_.zone].pue * hour_saving(fc, use_.need_h, win, fr)
+                ((up.watts * use_.k) / 1000.0) * cat.zones[use_.zone].pue * hour_saving(fc, use_.need_h, win, fr, !up.is_cpu, ep)
             } else {
                 0.0
             };
+            // yieldFlat: a CPU job whose zone pays back little for a long window — the cheapest hours its
+            // forecast offers are within yield_fv_max of running straight through — waits without a VM until its
+            // slack falls to yield_slack_h, so its quota goes to queued jobs in zones that do pay back
+            let mut yield_at = None;
+            if o.yield_flat && pick.is_some() && !use_.forced && up.is_cpu && !fc.is_empty() {
+                let n_run = jmin(fc.len() as f64, jmax(1.0, use_.need_h.ceil())) as usize;
+                let straight = fc.fc[..n_run].iter().fold(0.0, |a, b| a + b) / n_run as f64;
+                let fv = if straight > 0.0 { 1.0 - use_.exp_i / straight } else { 1.0 };
+                let slack = use_.hard_h - use_.need_h;
+                if slack > o.yield_slack_h + 0.5 && fv < o.yield_fv_max {
+                    yield_at = Some(t_h + slack - o.yield_slack_h);
+                }
+            }
             if pick.is_none() {
                 memo.insert(wid(j), Memo { zone: cat.zones[use_.zone].slug.clone(), prof: up.id.clone(), k: use_.k });
             } else {
                 memo.remove(&wid(j));
             }
-            fresh.push(Fresh { job: ji, item: items.len() - 1, pick, use_, gate_now, value, list });
+            fresh.push(Fresh { job: ji, item: items.len() - 1, pick, use_, gate_now, value, list, yield_at });
         }
         // Future releases take part in the fast-forward with their best placement at release time.
         for &ji in &open {
@@ -1159,28 +1276,80 @@ impl Policy {
             wt = m.iter().map(|v| v / mean).collect();
         }
         let bar = |fp: &Fp| if blocked { o.pressure_value_per_core * fp.cores } else { o.min_value_per_core * fp.cores };
+        // jobs on very clean grids save little by pausing, so while anyone queues they keep running
+        let clean_job = |d: &Deployed| -> bool {
+            let f = self.win(d.zone);
+            !f.is_empty() && (f.fc.iter().fold(0.0, |a, b| a + b) / f.len() as f64) * cat.zones[d.zone].pue < o.clean_no_pause_i
+        };
         struct CandP {
             pause: bool,
             item: usize,
             value: f64,
+            /// yieldFlat: the whole wait, not one hour
+            until: Option<f64>,
+            /// harmless pause: must move no queued job's start
+            low: bool,
         }
         let mut cands: Vec<CandP> = Vec::new();
         for d in &deployed {
             let wv = d.value * wt[view.jobs[d.job].w];
-            if d.pausable && !d.gate_run && d.value > 0.0 && wv >= bar(&items[d.item].fp) {
-                cands.push(CandP { pause: true, item: d.item, value: wv });
+            if d.pausable
+                && !d.gate_run
+                && d.value > 0.0
+                && wv >= bar(&items[d.item].fp)
+                && !(blocked && o.clean_no_pause_i > 0.0 && clean_job(d))
+            {
+                cands.push(CandP { pause: true, item: d.item, value: wv, until: None, low: false });
             }
         }
         for x in &fresh {
             let wv = x.value * wt[view.jobs[x.job].w];
-            if x.pick.is_some() && !x.gate_now && x.value > 0.0 && wv >= bar(&items[x.item].fp) {
-                cands.push(CandP { pause: false, item: x.item, value: wv });
+            if x.pick.is_some() && x.yield_at.is_none() && !x.gate_now && x.value > 0.0 && wv >= bar(&items[x.item].fp) {
+                cands.push(CandP { pause: false, item: x.item, value: wv, until: None, low: false });
             }
         }
-        cands.sort_by(|a, b| {
+        let by_value = |a: &CandP, b: &CandP| {
             let d = b.value - a.value;
             if d != 0.0 && !d.is_nan() { d.partial_cmp(&0.0).unwrap() } else { std::cmp::Ordering::Equal }
-        });
+        };
+        cands.sort_by(by_value);
+        // yielding jobs are checked first, with their whole wait (not one hour) in the projection
+        let yields: Vec<CandP> = fresh
+            .iter()
+            .filter(|x| x.yield_at.is_some())
+            .map(|x| CandP { pause: false, item: x.item, value: f64::INFINITY, until: x.yield_at, low: false })
+            .collect();
+        cands.splice(0..0, yields);
+        // harmlessPauses: while jobs queue, a pause below the bar is still granted when the projection shows it
+        // moves no queued job's start (the bar keeps quota for them; this job's quota isn't what they wait for)
+        if o.harmless_pauses && blocked {
+            let mut low: Vec<CandP> = deployed
+                .iter()
+                .filter(|d| {
+                    let wv = d.value * wt[view.jobs[d.job].w];
+                    d.pausable
+                        && !d.gate_run
+                        && d.value > 0.0
+                        && !(wv >= bar(&items[d.item].fp))
+                        && !(o.clean_no_pause_i > 0.0 && clean_job(d))
+                })
+                .map(|d| CandP { pause: true, item: d.item, value: d.value * wt[view.jobs[d.job].w], until: None, low: true })
+                .collect();
+            low.sort_by(by_value);
+            cands.extend(low);
+        }
+        if o.harmless_defers && blocked {
+            let mut low: Vec<CandP> = fresh
+                .iter()
+                .filter(|x| {
+                    let wv = x.value * wt[view.jobs[x.job].w];
+                    x.pick.is_some() && !x.gate_now && x.value > 0.0 && !(wv >= bar(&items[x.item].fp))
+                })
+                .map(|x| CandP { pause: false, item: x.item, value: x.value * wt[view.jobs[x.job].w], until: None, low: true })
+                .collect();
+            low.sort_by(by_value);
+            cands.extend(low);
+        }
         {
             let base0: Vec<f64> = (0..items.len()).map(|i| plan.late(i, &items)).collect();
             // jobs still queued for quota pay for other jobs' pauses later: while anyone is queued, a
@@ -1191,7 +1360,7 @@ impl Policy {
                 if c.pause {
                     items[c.item].start_at = t_h + q;
                 } else {
-                    items[c.item].avail = t_h + q;
+                    items[c.item].avail = c.until.unwrap_or(t_h + q);
                 }
                 let r = self.fast_forward(cat, t_h, &base, &items);
                 let mut ok = r.late(c.item, &items) <= -buffer;
@@ -1206,6 +1375,18 @@ impl Policy {
                 if ok {
                     for (i, b0) in base0.iter().enumerate() {
                         if r.late(i, &items) > jmax(*b0, -cushion) + 1e-6 {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                    #[allow(clippy::needless_range_loop)]
+                if ok && c.low {
+                    for i in 0..items.len() {
+                        if !items[i].deployed
+                            && i != c.item
+                            && r.start[i].unwrap_or(f64::INFINITY) > plan.start[i].unwrap_or(f64::INFINITY) + 1e-6
+                        {
                             ok = false;
                             break;
                         }
