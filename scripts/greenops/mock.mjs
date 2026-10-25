@@ -191,9 +191,21 @@ class Engine {
 
 function makeMockApi(engine, clock, latMs, r) {
   const lat = () => latMs * Math.exp(0.6 * gauss(r));
+  // MOCK_STALL="h,ms": once the run reaches sim hour h ("r": random in 60-115), the server holds every
+  // request for ms of wall time (live run f085e7d7: a 32 s stall near hour 103)
+  // (optional third value: seconds of 3-5 s slow replies before the hold, as seen live)
+  const [sh, sms, srs] = String(process.env.MOCK_STALL ?? "0,0").split(",");
+  const stallH = sh === "r" ? 60 + 55 * r() : Number(sh), stallMs = Number(sms), rampH = (Number(srs ?? 0) * 720) / 3600;
+  let stallAt = null;
   const call = async (fn) => {
     const L = lat(), u = 0.3 + 0.6 * r();
     await clock.sleep(L * u);
+    if (stallMs > 0) {
+      engine.advanceTo(clock.now());
+      if (stallAt == null && engine.started && engine.t >= stallH - rampH && engine.t < stallH) await clock.sleep(3000 + 2000 * r());
+      if (stallAt == null && engine.started && engine.t >= stallH) stallAt = clock.now();
+      if (stallAt != null && clock.now() < stallAt + stallMs) await clock.sleep(stallAt + stallMs - clock.now());
+    }
     engine.advanceTo(clock.now());
     const res = fn();
     await clock.sleep(L * (1 - u));

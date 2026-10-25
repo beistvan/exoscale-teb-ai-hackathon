@@ -4,7 +4,7 @@ Team **zero-reference** · Exoscale GreenOps Challenge, The Energy Bridge Critic
 
 An autonomous controller that completes the challenge's 15 CPU/GPU workloads on the simulated European cloud with as little electricity CO₂ as possible, without missing a deadline or breaking a residency rule. It decides **where** each workload runs (zone, machine, number of workers), **when** it runs or pauses, and **when** its VMs are deleted. It uses only the public catalog and the controlled run's own status, forecasts and published grid observations.
 
-**Best practice runs:** `d84022b1` — **22 079.8 points**, 13.03 kg CO₂e electricity, 15/15 delivered on time; with the default settings. `f3f0384c` (22 080.8) made the same placements with one research option on.
+**Best practice run:** `5c35cc4b` — **22 086.0 points**, 12.99 kg CO₂e electricity, 15/15 delivered on time, with the default settings. Earlier: `d84022b1` 22 079.8, `f3f0384c` 22 080.8.
 
 Challenge rules and API: [greenops-challenge-starter-kit](https://github.com/exogmi/greenops-challenge-starter-kit) (`docs/RULES.md`, `docs/API.md`).
 
@@ -27,17 +27,21 @@ docker run --rm --read-only --tmpfs /tmp --env-file run.env greenops-controller
   - `GREENOPS_CLOUD_ENDPOINT`, `GREENOPS_WORK_ENDPOINT`, `GREENOPS_GRID_ENDPOINT`, `GREENOPS_GRID_SECRET`
 
   `run.env` holds them as plain `KEY=value` lines (no `export`, no quotes), or pass each with `-e KEY`. Optional `GREENOPS_STATE_DIR` (default `/tmp`) holds the receipt `greenops-orchestrator-state.json` and the logs `orchestrator-run.log` and `orchestrator-events.jsonl`.
+  Optional, for experiments only (unset for the official rerun): `GREENOPS_POLICY_OPTS` / `GREENOPS_CONTROL_OPTS`, JSON objects that override `DEFAULTS` in `policy.mjs` / `CONTROL` in `controller.mjs`, e.g. `GREENOPS_POLICY_OPTS={"pickyFrac":0.7,"pickyGpuOnly":false}`.
 - **Preflight (optional, read-only):** append `--dry` to the run command. It reads the run and prints the first decision without creating anything, so the clock does not start.
 - **Offline self-test (optional):** `docker run --rm --entrypoint node greenops-controller scripts/greenops/mock.mjs 20 --lat 3000` should report `failures 0/20`.
 - **Tested** under the judging limits (`--read-only --tmpfs /tmp --user 65534:65534 --cpus 2 --memory 1g`), built from a clean checkout: the mock passes, and a `--dry` pass works against a live READY run.
 
 ## How the controller decides
 
-1. **Where** — each job goes to the legal zone and machine with the lowest expected carbon: energy × the datacenter's PUE × the cheapest forecast hours it will need, with a small penalty for taking a large share of the shared vCPU / GPU quota. Residency is re-checked right before every create; an illegal attempt would disqualify the run.
-2. **When** — a job runs in the cleanest hours of the published 24 h forecast, as many as it still needs before its deadline, and is stopped (0 W) in the dirtier ones. Pauses are ranked by the **points** they save, using the exact score formula. With a fast API, a job's VM is created about boot + input time before its release. Its input is then loaded by the time it releases, leaving the whole window for compute (if it would otherwise sit waiting, it is parked at 0 W).
+1. **Where** — each job goes to the legal zone and machine with the lowest expected carbon: energy × the datacenter's PUE × the cheapest forecast hours it will need, with a small penalty for taking a large share of the shared vCPU / GPU quota. Each forecast hour is the mean of the three newest forecast vintages (each corrected for its own lead), so one vintage's level error can't decide a 35–46 h job's zone. Residency is re-checked right before every create; an illegal attempt would disqualify the run.
+2. **When** — a job runs in the cleanest hours of the published 24 h forecast, as many as it still needs before its deadline, and is stopped (0 W) in the dirtier ones. Pauses are ranked by the **points** they save, using the exact score formula. With a fast API, a job's VM is created about boot + input time before its release. Its input is then loaded by the time it releases, leaving the whole window for compute (if it would otherwise sit waiting, it is parked at 0 W). The staged VM is started for its release only if the release hour itself passes the clean-hour rule.
 3. **Safety** — before any pause or delayed start it fast-forwards the rest of the schedule: all jobs run flat-out afterwards, and they claim the 320-vCPU quota in deadline order, including jobs not released yet. A pause is kept only if every job still finishes before its deadline minus a margin. While a job that may use several workers waits, its quota is reserved as a single worker, so it can't be pushed to the end and squeezed in.
 4. **Forecast correction** — every hour it compares this run's published observations with what its earlier forecasts said. It applies a learned per-lead-time bias (shrunk toward 0, capped at ±30 %). When this run's misses persist from hour to hour (lag-1 correlation ≥ 0.3 over ≥ 12 hourly pairs), it also carries the latest miss forward, fading at the measured rate.
+   **Fresh vintages:** forecasts and observations are re-fetched until the held vintage is the server's current hour. Before, the fetch was timed for the next *action* hour, which runs ahead of the server clock by the API lag, so it mostly got the previous hour's vintage (mock: 68 % of planning steps at 0.3 s lag) and kept it all hour: every hour was planned from a forecast one hour old, and its pause/run switch landed 0.04–0.11 h late (visible in `d84022b1`'s timeline). Now hour h is decided ahead of time from vintage h−1, then corrected as soon as vintage h and hour h's observation exist. A stop may follow a start after 0.1 h (was 0.6 h), so that correction can act.
 5. **Slow API** — status polls, forecasts and VM actions run in the background, so a slow call never stalls the loop. It extrapolates the simulated clock, plans for when an action will actually land, and widens margins as lag grows. Settings that only pay off with a fast API switch on only below ≈ 0.15 simulated hours of lag (≈ 0.75 s per call at 720×): wider CPU windows, a lower pause bar, a 1 h instead of 4 h minimum deadline margin for CPU jobs, and pre-staging.
+   - **Hour-aligned decisions:** the loop sleeps only until the next hour boundary (action time or server time) and decides again ~30 ms after a newer forecast vintage or observation arrives. At 720× the old fixed 250 ms loop is 0.05 simulated hours, and `e5a54267`'s pause/run switches landed 0.051 h after the hour on average; `5c35cc4b`'s landed after 0.019 h.
+   - **Stalls:** the planning latency is the median of the last 15 calls. One stalled reply used to lift the latency average to hours, switch off every low-lag setting and inflate all margins; in the mock that panic pushed a waiting job onto a far too slow machine. A paused or not-yet-created job also keeps 10 s of wall time (2 h at 720×) before its deadline, 35 s while the server shows stress (a call over 2 s, finished or in flight, in the last minute).
 6. **Housekeeping** — deterministic VM names and a receipt. It adopts VMs it didn't create, deletes VMs as soon as their job delivers, and deletes the VMs of a job whose deadline has passed.
 
 Code: `scripts/orchestrator.mjs` (entry point) → `scripts/greenops/`: `policy.mjs` decides, `controller.mjs` executes, `model.mjs` holds the catalog, legality and score, `liveapi.mjs` talks to the API, `mock.mjs` tests offline.
@@ -60,6 +64,9 @@ Practice runs (15/15 delivered on time, 0 API errors each):
 | `6e5310e5` | 22 066.6 | 13.12 kg | 720×; `4c6e96e2`'s test + automatic observation alignment (`obsShiftH: "auto"`). It found observations are stamped with their own hour, i.e. the default 0 |
 | `51b1f33d` | 22 068.1 | 13.10 kg | 720×; the same + the 9 % GPU early-phase margin |
 | `f3f0384c` | 22 080.8 | 13.02 kg | 720×; `d84022b1` + `windowDist`: for short jobs in long windows, the hours beyond the forecast are modelled with this run's observed hours. Germany still didn't look better for w-10, so placements matched `d84022b1` (every job within 0.1 %). Off by default |
+| `e5a54267` | 22 080.2 | 13.02 kg | 720×; fresh forecast vintages, placement averaged over 3 vintages, staged-release gate, 0.1 h stop dwell. Same placements; every job within ±4 g of `d84022b1` (the live API answered in ~15 ms, so vintages were mostly fresh already) |
+| `f085e7d7` | 17 074.8 | 13.00 kg | 720×; + hour-aligned decisions. **w-15 missed its deadline:** the server stalled (calls of 3–5 s, then a 32 s start = 6.5 simulated hours) while w-15 was paused with ~1 h of margin. Led to the stall handling in point 5 |
+| `5c35cc4b` | **22 086.0** | **12.99 kg** | 720×; + stall handling (median latency, stall guard). Same placements; +6 pts from timing |
 
 The four test runs (`4c6e96e2` … `51b1f33d`) all used the current-hour observation from t=0. All four made the Swiss jobs cleaner (w-04: 0.256 → 0.248 kg) and the GPU jobs dirtier (w-09: 4.012 → 4.02–4.07 kg). Pausing the Swiss jobs more precisely made them hold quota longer, which squeezed the other jobs. `d84022b1`'s settings stay the default.
 
@@ -84,6 +91,7 @@ Pre-staging cost 11–53 pts at 3–10 s API lag, so it only runs at low lag. Qu
 
 Verified from the platform docs, the API and our runs:
 
+- **API latency:** at low load the live API answers in ~15 ms (median of every status poll and VM action in runs `e5a54267` and `5c35cc4b`), but under load it can stall: in `f085e7d7` a start took 32 s.
 - The clock starts on the **first accepted VM create**, not at run creation. Official judging uses a fresh run at **720×** (120 simulated hours in ≈ 10 min), so 1 s of API lag costs 0.2 simulated hours.
 - **Score** (frozen `greenops-score-v2`, electricity only): per workload `20000 · (Rᵢ/ΣR) / (1 + 0.75·cᵢ/Rᵢ + 0.25·C/ΣR)`, plus 5 000 if all 15 deliver on time.
   - `Rᵢ` = 200 g/kWh × the workload's reference energy (`challenge/rules.json`), `cᵢ` its electricity CO₂, `C` the total.
@@ -127,5 +135,7 @@ The same steps run inside the web-app container via `make mock`, `make attempt-d
 - `MOCK_HIST_LAG=0` — observation publication lag; `MOCK_HIST_SHIFT=1` — observations stamped one hour late;
 - `MOCK_FC_ANOM_AREA='{"ES":[0.19,0.79],...}'` — per-area forecast-miss size and persistence; `MOCK_DRIFT='{"DE":[0.3,0.5],...}'` — per-area day-level volatility and persistence;
 - oracles: `MOCK_FC_PERFECT=24` (perfect forecast of that many hours), `MOCK_CORES=400` (another vCPU quota); `--opt forceProfile='{"w-09-eu-large-model":"gpurtx6000pro.medium"}'` pins a machine.
+- `MOCK_STALL='r,32000,5'` — a server stall: from a random hour in 60–115 (or a given hour) every request is held 32 s, after 5 s of 3–5 s replies. Without the ramp, the old latency average missed a deadline in 5 of 24 seeds and the median latency in none. With the ramp, 2 of 24 still miss unless the guard is a fixed 35 s, which costs ≈ 29 pts per run without stalls, so the default guard is adaptive (−1 pt).
+- Mock lag `--lat 20` matches the live API; at 300 ms and above the old forecast-fetch timing was much staler than live, which overstated the fresh-vintage gain (mock +46 pts, live ±0).
 
 **Web dashboard (optional):** `make run` builds and starts it (default http://localhost:3005/). `/live` polls a run read-only; credentials stay server-side.

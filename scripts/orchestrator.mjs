@@ -58,15 +58,19 @@ const cat = loadCatalog();
 cat.T0 = Math.floor(Math.min(...[...cat.workloads.values()].map((w) => w.release)) / 86400000) * 86400000;
 
 const realClock = { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
+// experiment overrides (JSON objects; unset = the defaults in policy.mjs DEFAULTS / controller.mjs CONTROL)
+const jsonEnv = (k) => { try { return env[k] ? JSON.parse(env[k]) : {}; } catch (e) { console.error(`bad ${k}: ${e.message}`); process.exit(2); } };
+const policyOpts = jsonEnv("GREENOPS_POLICY_OPTS"), ctlOpts = jsonEnv("GREENOPS_CONTROL_OPTS");
 
 async function main() {
   log(`[boot] run=${RUN} mode=${MODE}${DRY ? " (dry)" : ""} state=${STATE}`);
+  if (Object.keys(policyOpts).length || Object.keys(ctlOpts).length) log(`[boot] overrides policy=${JSON.stringify(policyOpts)} control=${JSON.stringify(ctlOpts)}`);
   await api.discover(cat, log);
   log(`[boot] discovery done: ${cat.zones.size} zones, templates for ${api.templates.size}`);
   if (DRY) {
     // one decision with no side effects
     const dryApi = { ...api, create: async (z, p, name) => ({ id: `dry-${name}` }), vmAction: async () => ({ ok: true }), remove: async () => ({ ok: true }), listInstances: async () => [], findByName: async () => null };
-    const c = new Controller({ cat, api: dryApi, clock: realClock, log, state: { run: RUN, vms: {}, seq: 0 }, save: () => {}, run: RUN });
+    const c = new Controller({ cat, api: dryApi, clock: realClock, log, state: { run: RUN, vms: {}, seq: 0 }, save: () => {}, run: RUN, opts: ctlOpts, policyOpts });
     const areas = [...new Set([...cat.zones.values()].map((z) => z.area))];
     const deadline = Date.now() + 90000;
     while (Date.now() < deadline && !(c.snap && areas.every((a) => c.fc.has(a)))) {
@@ -77,7 +81,7 @@ async function main() {
     log("[dry] one decision cycle done");
     process.exit(0);
   }
-  const ctl = new Controller({ cat, api, clock: realClock, log, state: st, save, run: RUN, event });
+  const ctl = new Controller({ cat, api, clock: realClock, log, state: st, save, run: RUN, event, opts: ctlOpts, policyOpts });
   if (MODE === "destroy") { await ctl.finalize("destroy requested"); return; }
   const stats = await ctl.runLoop();
   log(`[final] done: ${JSON.stringify(stats)}; receipt ${Object.keys(st.vms).length} VM(s) at ${STATE}`);
