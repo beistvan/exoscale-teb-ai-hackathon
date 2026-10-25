@@ -58,6 +58,9 @@ export const DEFAULTS = {
   windowDistMaxDuty: 0.4, // ...only for placements needing at most this share of their window (short jobs, long windows)
   stagedGate: true,    // with prestage: a staged job releasing within the action lead is gated on its release hour
   stallH: 0,           // sim hours a stopped job must keep before its deadline (set by the controller from stallBufferS)
+  extPremium: 0,       // >0: price the window beyond the forecast (same-hour/mean blend + this premium) in the gate
+  runFrac: 1,          // <1: running jobs use only this fraction of their proportional share of the visible cheap hours
+  extPremiumGpuOnly: false, // ...for GPU jobs only (live: postponing hurt GPU jobs, run 7 / 6b09df1e; a thinner CPU margin helped)
   missedOnServerTime: true, // "deadline passed" deletes use the server's snapshot time (false: the extrapolated time, as before)
   harmlessPauses: true,  // gate2: while jobs queue, grant below-bar pauses that move no queued job's projected start
   harmlessDefers: false, // ...and below-bar deferred starts of fresh jobs
@@ -108,30 +111,37 @@ let HP = 0;
 const risk = (fc) => (HP > 0 ? fc.map((v, i) => v * (1 + HP * Math.sqrt(i / 24))) : fc);
 
 /** Proportional rule: within the visible window, run in the cheapest ceil(W*need/avail) hours
- *  (frac < 1: only the cheapest frac of those — a pickier start). */
-export function gate(fc, needH, availH, frac = 1) {
+ *  (frac < 1: only the cheapest frac of those — a pickier start).
+ *  extPremium (EP > 0): the hours of the window beyond the forecast are priced too, each as 50 % the same hour of day
+ *  in the forecast and 50 % its mean, plus EP — known cheap hours beat guesses, so work isn't postponed into unseen
+ *  hours (live runs 7 and 6b09df1e lost by postponing into far forecast hours that turned out dirtier). */
+let EP = 0, EP_GPU = false;
+function threshold(fc, needH, availH, frac = 1, gpu = true) {
+  const W = Math.max(1, Math.min(fc.length, Math.floor(availH)));
+  const vis = risk(fc).slice(0, W);
+  if (EP > 0 && (gpu || !EP_GPU) && availH > fc.length + 1 && frac === 1) {
+    const mean = fc.reduce((a, b) => a + b, 0) / fc.length, U = Math.floor(availH) - fc.length;
+    const all = [...vis, ...Array.from({ length: U }, (_, k) => (1 + EP) * (0.5 * fc[k % fc.length] + 0.5 * mean))].sort((a, b) => a - b);
+    return all[Math.min(all.length, Math.max(1, Math.ceil(needH))) - 1];
+  }
+  const n = Math.min(W, Math.max(1, Math.ceil((frac * W * needH) / availH + 1e-9)));
+  return vis.sort((a, b) => a - b)[n - 1];
+}
+export function gate(fc, needH, availH, frac = 1, gpu = true) {
   if (needH <= 0) return true;
   if (!fc?.length || needH >= availH - 0.25) return true;
-  const W = Math.max(1, Math.min(fc.length, Math.floor(availH)));
-  const n = Math.min(W, Math.max(1, Math.ceil((frac * W * needH) / availH + 1e-9)));
-  const sorted = risk(fc).slice(0, W).sort((a, b) => a - b);
-  return fc[0] <= sorted[n - 1] + 1e-9;
+  return fc[0] <= threshold(fc, needH, availH, frac, gpu) + 1e-9;
 }
 /** True when waiting would save less than `band` (relative) — i.e. within forecast noise. */
-function withinNoise(fc, needH, availH, band) {
+function withinNoise(fc, needH, availH, band, gpu = true) {
   if (!(band > 0) || !fc?.length || needH >= availH - 0.25) return false;
-  const W = Math.max(1, Math.min(fc.length, Math.floor(availH)));
-  const n = Math.min(W, Math.ceil((W * needH) / availH + 1e-9));
-  const thr = risk(fc).slice(0, W).sort((a, b) => a - b)[n - 1];
+  const thr = threshold(fc, needH, availH, 1, gpu);
   return fc[0] - thr < band * Math.max(1, thr);
 }
 /** gCO2e/kWh saved by moving the current hour of work to the hour the gate would use instead. */
-function hourSaving(fc, needH, availH, frac = 1) {
+function hourSaving(fc, needH, availH, frac = 1, gpu = true) {
   if (!fc?.length || needH >= availH - 0.25) return 0;
-  const W = Math.max(1, Math.min(fc.length, Math.floor(availH)));
-  const n = Math.min(W, Math.max(1, Math.ceil((frac * W * needH) / availH + 1e-9)));
-  const sorted = risk(fc).slice(0, W).sort((a, b) => a - b);
-  return Math.max(0, fc[0] - sorted[n - 1]);
+  return Math.max(0, fc[0] - threshold(fc, needH, availH, frac, gpu));
 }
 
 /** Expected carbon (g) of a fresh placement started at tH, plus its timing numbers. */
@@ -287,6 +297,7 @@ export function decide(cat, view, opts = {}) {
   // latency term is kept): mock +10..+33 pts, 0 misses in 220 runs at a 1 h base
   if (o0.latH <= o0.lowLatH && o.marginCutH > 0) { o.marginMinHGpu = Math.max(o.lowLatMarginMinH, o0.marginMinH - (o.gpuMarginCutH ?? 0)); o.marginMinH = Math.max(o.lowLatMarginMinH, o0.marginMinH - o.marginCutH); }
   HP = Number(o.horizonPenalty) || 0;
+  EP = Number(o.extPremium) || 0; EP_GPU = Boolean(o.extPremiumGpuOnly);
   LLF = Boolean(o.llf);
   o.distFor = view.dist;
   const acts = [];
@@ -360,7 +371,11 @@ export function decide(cat, view, opts = {}) {
     const fc = nearRel && fcNow?.length > 1 ? fcNow.slice(Math.min(fcNow.length - 1, Math.max(0, Math.round(relH(j)) - Math.floor(tH)))) : fcNow;
     const sinceH = tH - (j.deployedH ?? tH);
     const availH = (prof.family === "cpu" ? Math.min(due - tH, Math.max(runNeed, o.cpuWindowH - sinceH)) : due - tH) - (nearRel ? wait : 0);
-    let gateRun = !pausable || gate(fc, runNeed, availH) || withinNoise(fc, runNeed, availH, o.noiseBand);
+    const isGpu = prof.family !== "cpu";
+    // runFrac < 1: a running job keeps to the cheapest runFrac of its proportional share of the visible hours, i.e.
+    // waits a little more for later cheap hours (live run 4c65d496: front-loading lost 12 pts — waiting pays)
+    const rf = o.runFrac ?? 1;
+    let gateRun = !pausable || gate(fc, runNeed, availH, rf, isGpu) || (rf === 1 && withinNoise(fc, runNeed, availH, o.noiseBand, isGpu));
     // The forecast is hourly but this runs every 250 ms: the need/window ratio drifts within the hour
     // and flipped jobs off and on minutes apart. Decide once per forecast hour and keep it (a
     // deadline-forced run always wins).
@@ -370,7 +385,7 @@ export function decide(cat, view, opts = {}) {
       if (m && m.h === hr && !forced) gateRun = m.run;
       else view.memo.set(key, { h: hr, run: gateRun });
     }
-    const value = pausable && !gateRun ? (prof.watts * k / 1000) * zone.pue * hourSaving(fc, runNeed, availH) : 0;
+    const value = pausable && !gateRun ? (prof.watts * k / 1000) * zone.pue * hourSaving(fc, runNeed, availH, rf, isGpu) : 0;
     const fcMean = fc?.length ? fc.reduce((a, b) => a + b, 0) / fc.length : 0;
     const estG = ((prof.watts * k) / 1000) * (setupH(j.w, prof) + j.w.required / rateK(j.w, prof, k) + outputH(j.w)) * zone.pue * fcMean;
     // preemption facts: work kept if deleted now, and how long the forecast stays dirty
@@ -442,9 +457,10 @@ export function decide(cat, view, opts = {}) {
     // very cleanest hours, so later forecasts can still move it — waiting holds no quota and costs little
     const availF = Math.min(use.hardH, o.cpuWindowH);
     const fr = o.pickyFrac < 1 && pick && !use.forced && (!o.pickyGpuOnly || use.prof.family !== "cpu") && use.hardH - use.needH > o.pickyMinSlackH ? o.pickyFrac : 1;
-    const gateNow = o.noGate || use.forced || !pick || preRelease || (!cpuPause && use.prof.family === "cpu") || gate(fc, use.needH, availF, fr)
-      || (fr === 1 && withinNoise(fc, use.needH, availF, o.noiseBand));
-    const value = pick && !gateNow ? (use.prof.watts * use.k / 1000) * use.zone.pue * hourSaving(fc, use.needH, availF, fr) : 0;
+    const fGpu = use.prof.family !== "cpu";
+    const gateNow = o.noGate || use.forced || !pick || preRelease || (!cpuPause && use.prof.family === "cpu") || gate(fc, use.needH, availF, fr, fGpu)
+      || (fr === 1 && withinNoise(fc, use.needH, availF, o.noiseBand, fGpu));
+    const value = pick && !gateNow ? (use.prof.watts * use.k / 1000) * use.zone.pue * hourSaving(fc, use.needH, availF, fr, fGpu) : 0;
     if (view.memo) { if (!pick) view.memo.set(x.j.w.id, { zone: use.zone.slug, prof: use.prof.id, k: use.k }); else view.memo.delete(x.j.w.id); }
     // yieldFlat: a CPU job whose zone pays back little for a long window — the cheapest hours its forecast offers
     // are within yieldFvMax of simply running straight through — waits without a VM until its slack falls to
