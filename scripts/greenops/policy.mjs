@@ -57,6 +57,7 @@ export const DEFAULTS = {
   windowDistMaxDuty: 0.4, // ...only for placements needing at most this share of their window (short jobs, long windows)
   stagedGate: true,    // with prestage: a staged job releasing within the action lead is gated on its release hour
   stallH: 0,           // sim hours a stopped job must keep before its deadline (set by the controller from stallBufferS)
+  rateFloor: 0,        // plan with at least this fraction of the catalog speed (0: trust the learned speed fully)
   pickyFrac: 1,        // <1: a fresh job with slack > pickyMinSlackH starts only in this fraction of its gate's clean hours
   pickyMinSlackH: 24, pickyGpuOnly: true,
   pauseOutput: false,  // allow pausing during the final output phase (it otherwise always runs)
@@ -153,6 +154,12 @@ export function scorePlacement(cat, w, c, rem, tH, fcFor, o, calib = 1) {
   return { ...c, needH, availH, hardH, slackH: hardH - needH, expI, kwh, grams: kwh * c.zone.pue * expI };
 }
 
+// learned engine speed (per work unit), never below rateFloor x the catalog: live runs follow the catalog exactly
+// (w-03 restarted ~40 times, its lifecycle hours match catalog speed within 0.05 h), but single rate samples taken
+// around a stop/start read as low as 0.28 — need jumped to 111 h for a 31 h job (run 5c35cc4b, t=7.2), which
+// forced starts and made the projection see phantom lateness
+const calOf = (view, unit, o) => Math.max(o.rateFloor, view.calib?.[unit] ?? 1);
+
 const footprint = (p, k) => ({ vms: k, cores: p.cores * k, fam: p.family, cards: p.family === "cpu" ? 0 : p.cards * k });
 
 /** Fast-forward the remaining schedule with reservations (conservative backfilling).
@@ -213,7 +220,7 @@ export function fastForward(cat, t0, base, items, DT = 0.5) {
  *  clears its margin, deadline-feasible ones by carbon, then the fastest — it still has to go. */
 function placements(cat, view, o, j, tPlan) {
   const rem = Math.max(0, j.w.required - j.done);
-  const cal = view.calib?.[j.w.unit] ?? 1;
+  const cal = calOf(view, j.w.unit, o);
   const fcP = view.fcPlace ?? view.fc; // placement may average several forecast vintages (controller placeVintages)
   let scored = candidates(cat, j.w).map((c) => scorePlacement(cat, j.w, c, rem, tPlan, fcP, o, cal)).filter(Boolean);
   // (experiment only) forceProfile: { wl: "family.size" } pins a job's machine — oracle tests in the mock
@@ -310,14 +317,14 @@ export function decide(cat, view, opts = {}) {
     if (o.replaceForeign && j.vms.every((v) => v.adopted) && j.done <= 0 && tH - relH(j) < 0.5) {
       const tP = Math.max(tH, relH(j));
       const best = placements(cat, view, o, j, tP)[0];
-      const cur = scorePlacement(cat, j.w, { zone, prof, k }, rem, tP, view.fcPlace ?? view.fc, { ...o, maxDuty: 1 }, view.calib?.[j.w.unit] ?? 1);
+      const cur = scorePlacement(cat, j.w, { zone, prof, k }, rem, tP, view.fcPlace ?? view.fc, { ...o, maxDuty: 1 }, calOf(view, j.w.unit, o));
       if (best && cur && !best.forced && best.grams < cur.grams * (1 - o.replaceMinRel) && cur.grams - best.grams > o.replaceMinG) {
         for (const vm of j.vms) acts.push({ type: "delete", wl: j.w.id, vm, why: `replace foreign ${prof.label}@${zone.slug} (est ${cur.grams.toFixed(0)}g) by ${best.prof.label}@${best.zone.slug} (est ${best.grams.toFixed(0)}g)` });
         continue; // re-placed as a fresh job once the delete lands
       }
     }
-    const model = rateK(j.w, prof, k) * (view.calib?.[j.w.unit] ?? 1);
-    const rate = j.obsRate > 0 ? Math.min(j.obsRate, model * 1.05) : model;
+    const model = rateK(j.w, prof, k) * calOf(view, j.w.unit, o);
+    const rate = j.obsRate > 0 ? Math.min(Math.max(j.obsRate, rateK(j.w, prof, k) * o.rateFloor), model * 1.05) : model;
     const wait = Math.max(0, relH(j) - tH);
     const setupLeft = j.done > 0 ? 0 : Math.max(0, setupH(j.w, prof) - (j.runH ?? 0));
     const runNeed = setupLeft + rem / rate + outputH(j.w);
@@ -491,7 +498,7 @@ export function decide(cat, view, opts = {}) {
       const qh = Math.max(1, Math.round(q));
       for (const x of fresh) {
         if ((plan.start.get(x.j.w.id) ?? Infinity) <= tH + 1e-6 || !x.use || x.use.forced) continue;
-        const rem = Math.max(0, x.j.w.required - x.j.done), cal = view.calib?.[x.j.w.unit] ?? 1;
+        const rem = Math.max(0, x.j.w.required - x.j.done), cal = calOf(view, x.j.w.unit, o);
         const c = { zone: x.use.zone, prof: x.use.prof, k: x.use.k };
         const now = scorePlacement(cat, x.j.w, c, rem, tH, view.fc, o, cal);
         if (!now) continue;

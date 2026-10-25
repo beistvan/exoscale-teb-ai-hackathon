@@ -5,11 +5,15 @@ const H = 3.6e6;
 export class Tracker {
   constructor() { this.m = new Map(); } // wl -> { runH, lastT, lastDone, obsRate, setKey }
   /** Update per-job running time and observed compute rate (only across intervals where every
-   *  worker ran the whole time and progress moved). */
-  observe(wl, tH, done, vms) {
+   *  worker ran the whole time and progress moved).
+   *  raw (optional): vmId -> state as the engine reported it. With it, "ran the whole interval" uses the
+   *  engine's own states at both snapshots, and the previous state only advances with a new snapshot —
+   *  otherwise an acknowledged start (overlaid as "running" on the older snapshot) made the interval in
+   *  which the VM was still stopped count as running, and the rate sample came out far too low. */
+  observe(wl, tH, done, vms, raw = null) {
     const s = this.m.get(wl) ?? { deployedH: null, runH: 0, lastT: tH, lastDone: done, obsRate: 0, allRun: false, setKey: "" };
     const key = vms.map((v) => v.id).sort().join(",");
-    const allRun = vms.length > 0 && vms.every((v) => v.state === "running");
+    const allRun = vms.length > 0 && vms.every((v) => (raw ? raw.get(v.id) : v.state) === "running");
     const dt = tH - s.lastT;
     if (dt > 0 && s.allRun && allRun && key === s.setKey) {
       s.runH += dt;
@@ -25,7 +29,8 @@ export class Tracker {
     if (!vms.length) s.deployedH = null;
     if (key !== s.setKey) s.obsRate = 0; // new worker set → rate must be re-learned
     if (dt > 0 || key !== s.setKey) { s.lastT = tH; s.lastDone = done; }
-    s.allRun = allRun; s.setKey = key;
+    if (!raw || dt > 0 || key !== s.setKey) s.allRun = allRun;
+    s.setKey = key;
     this.m.set(wl, s);
     return s;
   }
@@ -34,7 +39,7 @@ export class Tracker {
 import { rateK } from "./model.mjs";
 
 /** receipt: Map vmId -> { wl, zone, prof } (VMs this controller created or adopted). */
-export function buildView(cat, status, receipt, tracker) {
+export function buildView(cat, status, receipt, tracker, raw = null) {
   const t = (Date.parse(status.virtual_time) - cat.T0) / H;
   const usage = { vms: 0, cores: 0, cards: {} };
   const seen = new Set();
@@ -60,7 +65,7 @@ export function buildView(cat, status, receipt, tracker) {
       vms.push({ id, zone: r.zone, prof: r.prof, state: "creating" });
     }
     const done = Number(sw.completed_work ?? 0);
-    const tr = tracker.observe(sw.id, t, done, vms);
+    const tr = tracker.observe(sw.id, t, done, vms, raw);
     jobs.push({ w, done, delivered: Boolean(sw.final_output_delivered), vms, runH: tr.runH, deployedH: tr.deployedH, obsRate: tr.obsRate, state: sw.state });
   }
   for (const [id, r] of receipt) if (!seen.has(id)) { seen.add(id); add(cat.profiles.get(r.prof)); }
