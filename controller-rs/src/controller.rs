@@ -61,6 +61,8 @@ pub struct ControlOpts {
     pub stall_trigger_ms: f64,
     /// ...within this many wall seconds
     pub stall_memory_s: f64,
+    /// measure compute rates from the engine's reported VM states only (see Tracker::observe)
+    pub raw_tracker: bool,
     /// cap on the latency used for planning (sim hours)
     pub max_lat_h: f64,
     /// learn each area's forecast error by lead time from this run's own published observations
@@ -97,6 +99,7 @@ impl ControlOpts {
                 "stall_base_s" => self.stall_base_s = v,
                 "stall_trigger_ms" => self.stall_trigger_ms = v,
                 "stall_memory_s" => self.stall_memory_s = v,
+                "raw_tracker" => self.raw_tracker = v != 0.0,
                 "max_lat_h" => self.max_lat_h = v,
                 "learn_bias" => self.learn_bias = v != 0.0,
                 "bias_shrink_n" => self.bias_shrink_n = v,
@@ -133,6 +136,7 @@ impl Default for ControlOpts {
             stall_base_s: 10.0,
             stall_trigger_ms: 2000.0,
             stall_memory_s: 60.0,
+            raw_tracker: false,
             max_lat_h: 4.0,
             learn_bias: true,
             bias_shrink_n: 24.0,
@@ -867,7 +871,13 @@ impl Core {
             }
             Some(overrides.get(vm_id).map(|o| o.state).unwrap_or(raw).to_string())
         };
-        let mut v = build_view(&self.cat, &snap.s, &overlay, &receipt, &mut self.tracker);
+        // rawTracker: rate samples use the engine's own VM states, not the acknowledged-action overlay
+        let raw: Option<FxMap<String, String>> = if self.o.raw_tracker {
+            Some(snap.s.workloads.iter().flat_map(|w| w.assignments.iter().map(|a| (a.vm_id.clone(), a.state.clone()))).collect())
+        } else {
+            None
+        };
+        let mut v = build_view(&self.cat, &snap.s, &overlay, &receipt, &mut self.tracker, raw.as_ref());
         v.t = t_act;
         let now_hour = t_act.floor();
         let hour_start = self.cat.t0 + now_hour * H;
@@ -1252,7 +1262,7 @@ impl Core {
                         // vh: the hour the returned vintage starts at (can be hour-1 when asked just past a boundary)
                         let vh = jsmath::round((pts[0].t - self.cat.t0) / H) as i64;
                         let n = pts.len();
-                        let newer = !self.fc.get(&area).is_some_and(|c| c.vh >= vh);
+                        let newer = self.fc.get(&area).is_none_or(|c| c.vh < vh);
                         if self.o.learn_bias {
                             // (the trace keeps vintage timing only, no grid values: every run shares one
                             // scenario grid, so a kept series would be a view of the next run's future)
@@ -1288,7 +1298,7 @@ impl Core {
                         self.data_ver += 1;
                         let newest = pts.iter().map(|p| p.t).fold(f64::NEG_INFINITY, crate::model::jmax);
                         let newest_h = jsmath::round((newest - self.cat.t0) / H) as i64;
-                        if !self.hist_newest.get(&area).is_some_and(|x| *x >= newest_h) {
+                        if self.hist_newest.get(&area).is_none_or(|x| *x < newest_h) {
                             self.wake_up();
                         }
                         let prev = self.hist_newest.get(&area).copied().unwrap_or(i64::MIN);

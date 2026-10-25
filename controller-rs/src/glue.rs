@@ -63,7 +63,16 @@ pub struct Tracker {
 impl Tracker {
     /// Update per-job running time and observed compute rate (only across intervals where every
     /// worker ran the whole time and progress moved). Returns (runH, deployedH, obsRate).
-    pub fn observe(&mut self, wl: &str, t_h: f64, done: f64, vms: &[VmView]) -> (f64, Option<f64>, f64) {
+    /// `raw` (rawTracker): vm id -> state as the engine reported it. With it, "ran the whole interval" uses
+    /// the engine's own states, and the previous state only advances with a new snapshot.
+    pub fn observe(
+        &mut self,
+        wl: &str,
+        t_h: f64,
+        done: f64,
+        vms: &[VmView],
+        raw: Option<&FxMap<String, String>>,
+    ) -> (f64, Option<f64>, f64) {
         let s = self.m.entry(wl.to_string()).or_insert_with(|| TrackState {
             deployed_h: None,
             run_h: 0.0,
@@ -76,7 +85,11 @@ impl Tracker {
         let mut ids: Vec<&str> = vms.iter().map(|v| v.id.as_str()).collect();
         ids.sort_unstable();
         let key = ids.join(",");
-        let all_run = !vms.is_empty() && vms.iter().all(|v| v.state == "running");
+        let all_run = !vms.is_empty()
+            && vms.iter().all(|v| match raw {
+                Some(r) => r.get(&v.id).is_some_and(|st| st == "running"),
+                None => v.state == "running",
+            });
         let dt = t_h - s.last_t;
         if dt > 0.0 && s.all_run && all_run && key == s.set_key {
             s.run_h += dt;
@@ -102,7 +115,9 @@ impl Tracker {
             s.last_t = t_h;
             s.last_done = done;
         }
-        s.all_run = all_run;
+        if raw.is_none() || dt > 0.0 || key != s.set_key {
+            s.all_run = all_run;
+        }
         s.set_key = key;
         (s.run_h, s.deployed_h, s.obs_rate)
     }
@@ -118,6 +133,7 @@ pub fn build_view(
     overlay: &dyn Fn(&str, &str) -> Option<String>,
     receipt: &[ReceiptRow],
     tracker: &mut Tracker,
+    raw: Option<&FxMap<String, String>>,
 ) -> View {
     let t = (status.virtual_time_ms.unwrap_or(f64::NAN) - cat.t0) / H;
     let mut usage = Usage::default();
@@ -166,7 +182,7 @@ pub fn build_view(
             });
         }
         let done = sw.completed_work;
-        let (run_h, deployed_h, obs_rate) = tracker.observe(&sw.id, t, done, &vms);
+        let (run_h, deployed_h, obs_rate) = tracker.observe(&sw.id, t, done, &vms, raw);
         jobs.push(JobView { w: wi, done, delivered: sw.delivered, vms, run_h, deployed_h, obs_rate, state: sw.state.clone() });
     }
     for r in receipt {

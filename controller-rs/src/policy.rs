@@ -62,6 +62,8 @@ pub struct Opts {
     pub picky_frac: f64,
     pub picky_min_slack_h: f64,
     pub picky_gpu_only: bool,
+    /// plan with at least this fraction of the catalog speed (0: trust the learned speed fully)
+    pub rate_floor: f64,
 }
 
 impl Opts {
@@ -110,6 +112,7 @@ impl Opts {
             picky_frac: 1.0,
             picky_min_slack_h: 24.0,
             picky_gpu_only: true,
+            rate_floor: 0.0,
         };
         if !tw.is_empty() {
             let b = |v: f64| v != 0.0;
@@ -147,6 +150,7 @@ impl Opts {
                     "picky_frac" => o.picky_frac = v,
                     "picky_min_slack_h" => o.picky_min_slack_h = v,
                     "picky_gpu_only" => o.picky_gpu_only = b(v),
+                    "rate_floor" => o.rate_floor = v,
                     _ => {}
                 }
             }
@@ -223,6 +227,10 @@ pub struct View {
 impl View {
     fn calib_for(&self, unit: &str) -> f64 {
         self.calib.iter().find(|(u, _)| u == unit).map(|(_, v)| *v).unwrap_or(1.0)
+    }
+    /// `calOf`: the learned engine speed, never below `rate_floor` x the catalog
+    fn cal_of(&self, unit: &str, o: &Opts) -> f64 {
+        jmax(o.rate_floor, self.calib_for(unit))
     }
 }
 
@@ -558,7 +566,7 @@ impl Policy {
     fn placements(&self, cat: &Catalog, view: &View, o: &Opts, memo: &FxMap<String, Memo>, j: &JobView, t_plan: f64) -> Vec<Placement> {
         let w = &cat.workloads[j.w];
         let rem = jmax(0.0, w.required - j.done);
-        let cal = view.calib_for(&w.unit);
+        let cal = view.cal_of(&w.unit, o);
         let mut scored: Vec<Placement> =
             self.cands[j.w].iter().filter_map(|&c| self.score_placement(cat, j.w, c, rem, t_plan, o, o.max_duty, cal)).collect();
         // rank = estimated grams x a quota-scarcity factor (scarcityMode "cores": span 1)
@@ -897,7 +905,7 @@ impl Policy {
                     t_p,
                     &o,
                     1.0,
-                    view.calib_for(&w.unit),
+                    view.cal_of(&w.unit, &o),
                 );
                 if let (Some(best), Some(cur)) = (best, cur) {
                     if !best.forced && best.grams < cur.grams * (1.0 - o.replace_min_rel) && cur.grams - best.grams > o.replace_min_g {
@@ -912,8 +920,8 @@ impl Policy {
                     }
                 }
             }
-            let model = rate_k(w, prof, k) * view.calib_for(&w.unit);
-            let rate = if j.obs_rate > 0.0 { jmin(j.obs_rate, model * 1.05) } else { model };
+            let model = rate_k(w, prof, k) * view.cal_of(&w.unit, &o);
+            let rate = if j.obs_rate > 0.0 { jmin(jmax(j.obs_rate, rate_k(w, prof, k) * o.rate_floor), model * 1.05) } else { model };
             let wait = jmax(0.0, rel_h(j) - t_h);
             let setup_left = if j.done > 0.0 { 0.0 } else { jmax(0.0, setup_h(w, prof) - j.run_h) };
             let run_need = setup_left + rem / rate + output_h(w);
