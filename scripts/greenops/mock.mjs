@@ -18,6 +18,7 @@
 import { loadCatalog, zoneLegal, profileLegal, fitsQuota, rateK, setupH, outputH, candidates, score } from "./model.mjs";
 import { Controller } from "./controller.mjs";
 import { decide as decideV1 } from "./policy-v1.mjs";
+import { decide } from "./policy.mjs";
 
 const H = 3.6e6;
 const SLOW = Number(process.env.MOCK_SLOW ?? 1), RESUME_BOOT_H = Number(process.env.MOCK_RESUME_BOOT_S ?? 0) / 3600;
@@ -27,6 +28,9 @@ const STAGING_IDLE = process.env.MOCK_STAGING === "idle"; // power model variant
 const PRESTAGE = process.env.MOCK_PRESTAGE !== "0";
 const HIST_LAG = Number(process.env.MOCK_HIST_LAG ?? 2), HIST_SHIFT = Number(process.env.MOCK_HIST_SHIFT ?? 0);
 const DRIFT = process.env.MOCK_DRIFT ? JSON.parse(process.env.MOCK_DRIFT) : {};
+// MOCK_FLAT="FR,CH": these areas get an almost flat grid (3 % daily swing, no day drift), e.g. a nuclear- or
+// hydro-dominated system; the random draws are consumed as usual so every other area's series is unchanged
+const FLAT = new Set(String(process.env.MOCK_FLAT ?? "").split(",").filter(Boolean));
 
 function rng(seed) { let s = (seed >>> 0) || 1; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 2 ** 32; }; }
 function gauss(r) { return Math.sqrt(-2 * Math.log(r() + 1e-12)) * Math.cos(2 * Math.PI * r()); }
@@ -46,7 +50,8 @@ export function makeGrid(seed, hours = 160) {
       // volatility (default: the random walk below) — e.g. a wind-driven grid swings more than a hydro one
       if (h % 24 === 0) drift = DRIFT[a] ? Math.max(0.3, Math.min(2.0, 1 + DRIFT[a][1] * (drift - 1) + DRIFT[a][0] * gauss(r)))
         : Math.max(0.6, Math.min(1.5, drift * (1 + 0.18 * gauss(r))));
-      arr.push(Math.max(5, m * drift * (1 + amp * Math.cos((2 * Math.PI * (h - pk)) / 24)) * (1 + 0.05 * gauss(r))));
+      const flat = FLAT.has(a), nz = gauss(r);
+      arr.push(Math.max(5, m * (flat ? 1 : drift) * (1 + (flat ? 0.03 : amp) * Math.cos((2 * Math.PI * (h - pk)) / 24)) * (1 + (flat ? 0.01 : 0.05) * nz)));
     }
     actual[a] = arr;
   }
@@ -78,8 +83,11 @@ export function makeGrid(seed, hours = 160) {
   return { actual, fc };
 }
 
+// MOCK_FREEZE="h,ms": at sim hour h this process freezes for ms of wall time while the server keeps running
+// (live run fc278340: the host froze 195 s at hour 51.6; afterwards its clock jumped forward)
+const [FREEZE_H, FREEZE_MS] = String(process.env.MOCK_FREEZE ?? "0,0").split(",").map(Number);
 class VClock {
-  constructor() { this.t = 0; this.q = []; this.seq = 0; }
+  constructor() { this.t = 0; this.q = []; this.seq = 0; this.frozen = false; }
   now() { return this.t; }
   sleep(ms) { return new Promise((r) => this.q.push({ at: this.t + Math.max(0, ms), seq: this.seq++, r })); }
   async drive(stop, wallLimit) {
@@ -90,6 +98,8 @@ class VClock {
       for (let i = 1; i < this.q.length; i++) if (this.q[i].at < this.q[mi].at || (this.q[i].at === this.q[mi].at && this.q[i].seq < this.q[mi].seq)) mi = i;
       const e = this.q.splice(mi, 1)[0];
       this.t = Math.max(this.t, e.at);
+      if (FREEZE_MS > 0 && !this.frozen && this.engine?.started && this.engine.t >= FREEZE_H) { this.frozen = true; this.t += FREEZE_MS; this.engine.advanceTo(this.t); }
+      this.onTick?.();
       e.r();
       if (this.t > wallLimit) break;
     }
@@ -259,6 +269,7 @@ export async function simulate(seed, { latMs = 3000, policyOpts = {}, ctlOpts = 
   const grid = makeGrid(seed);
   const clock = new VClock();
   const engine = new Engine(cat, grid);
+  clock.engine = engine;
   const api = makeMockApi(engine, clock, latMs, rng(seed * 31 + 7));
   const lines = [];
   const st = { run: "mock", vms: {}, seq: 0, deleted: [] };
@@ -271,7 +282,19 @@ export async function simulate(seed, { latMs = 3000, policyOpts = {}, ctlOpts = 
     clock.t = (lateStartH * H) / engine.speed;
     engine.advanceTo(clock.t);
   }
-  const ctl = new Controller({ cat, api, clock, log: (...a) => { if (verbose) lines.push(`${engine.t.toFixed(1)}h ${a.join(" ")}`); }, state: st, save: () => {}, run: "mockrun0", opts: ctlOpts, policyOpts, ...(process.env.MOCK_POLICY === "v1" ? { decideFn: decideV1 } : {}) });
+  // MOCK_CLOCKJUMP="h,ms,afterMs": at sim hour h the controller's host freezes for ms while the server runs on, and
+  // the host clock stands still meanwhile; afterMs later it jumps forward by ms (live run fc278340: h 51.6, 195 s)
+  const [CJ_H, CJ_MS, CJ_AFTER] = String(process.env.MOCK_CLOCKJUMP ?? "0,0,0").split(",").map(Number);
+  let cjOffset = 0, cjDone = false;
+  const ctlClock = CJ_MS > 0 ? { now: () => clock.now() - cjOffset, sleep: (ms) => clock.sleep(ms) } : clock;
+  if (CJ_MS > 0) clock.onTick = () => {
+    if (cjDone || !engine.started || engine.t < CJ_H) return;
+    cjDone = true; clock.t += CJ_MS; engine.advanceTo(clock.t); cjOffset = CJ_MS;
+    clock.sleep(CJ_AFTER).then(() => { cjOffset = 0; });
+  };
+  const ctl = new Controller({ cat, api, clock: ctlClock, log: (...a) => { if (verbose) lines.push(`${engine.t.toFixed(1)}h ${a.join(" ")}`); }, state: st, save: () => {}, run: "mockrun0", opts: ctlOpts, policyOpts, ...(process.env.MOCK_POLICY === "v1" ? { decideFn: decideV1 } : {}),
+    // MOCK_DECIDE_FAIL_H=h: every decision throws from sim hour h on (tests the controller's safe mode)
+    ...(process.env.MOCK_DECIDE_FAIL_H ? { decideFn: (c, v, o) => { if (v.t >= Number(process.env.MOCK_DECIDE_FAIL_H)) throw new Error("injected decide failure"); return decide(c, v, o); } } : {}) });
   ctl.runLoop();
   await clock.drive(() => ctl.done, 2.0e6);
   // carbon counts through the full window: let the engine run to 120h with whatever is left

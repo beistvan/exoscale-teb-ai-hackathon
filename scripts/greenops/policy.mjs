@@ -58,8 +58,12 @@ export const DEFAULTS = {
   windowDistMaxDuty: 0.4, // ...only for placements needing at most this share of their window (short jobs, long windows)
   stagedGate: true,    // with prestage: a staged job releasing within the action lead is gated on its release hour
   stallH: 0,           // sim hours a stopped job must keep before its deadline (set by the controller from stallBufferS)
+  missedOnServerTime: true, // "deadline passed" deletes use the server's snapshot time (false: the extrapolated time, as before)
   harmlessPauses: true,  // gate2: while jobs queue, grant below-bar pauses that move no queued job's projected start
   harmlessDefers: false, // ...and below-bar deferred starts of fresh jobs
+  handOver: false,     // gate2: a slot held by a fresh job that defers its start goes to the next queued job ready to run
+  yieldFlat: false,    // gate2: CPU jobs whose forecast pays back little for a long window wait (no VM) until slack = yieldSlackH
+  yieldFvMax: 0.05, yieldSlackH: 24,
   rateFloor: 0,        // plan with at least this fraction of the catalog speed (0: trust the learned speed fully)
   pickyFrac: 1,        // <1: a fresh job with slack > pickyMinSlackH starts only in this fraction of its gate's clean hours
   pickyMinSlackH: 24, pickyGpuOnly: true,
@@ -292,7 +296,9 @@ export function decide(cat, view, opts = {}) {
 
   for (const j of view.jobs) if (j.delivered) for (const vm of j.vms) acts.push({ type: "delete", wl: j.w.id, vm, why: "delivered" });
   // past its deadline: work no longer counts but electricity does — free the VMs, stop planning it
-  const missed = (j) => !j.delivered && (String(j.state ?? "").toLowerCase() === "deadline_missed" || tH > deadlineH(j) + 0.25);
+  // deadline passed: only on the server's word — its own snapshot time or the workload state, never the extrapolated
+  // action time (a clock jump made the controller delete every running job as "deadline passed" in run fc278340)
+  const missed = (j) => !j.delivered && (String(j.state ?? "").toLowerCase() === "deadline_missed" || ((o.missedOnServerTime ? view.tSnap : null) ?? tH) > deadlineH(j) + 0.25);
   for (const j of view.jobs) if (missed(j)) for (const vm of j.vms) acts.push({ type: "delete", wl: j.w.id, vm, why: "deadline passed" });
   const open = view.jobs.filter((j) => !j.delivered && !missed(j));
 
@@ -440,7 +446,20 @@ export function decide(cat, view, opts = {}) {
       || (fr === 1 && withinNoise(fc, use.needH, availF, o.noiseBand));
     const value = pick && !gateNow ? (use.prof.watts * use.k / 1000) * use.zone.pue * hourSaving(fc, use.needH, availF, fr) : 0;
     if (view.memo) { if (!pick) view.memo.set(x.j.w.id, { zone: use.zone.slug, prof: use.prof.id, k: use.k }); else view.memo.delete(x.j.w.id); }
-    fresh.push({ j: x.j, it, pick, use, gateNow, value, list: x.list });
+    // yieldFlat: a CPU job whose zone pays back little for a long window — the cheapest hours its forecast offers
+    // are within yieldFvMax of simply running straight through — waits without a VM until its slack falls to
+    // yieldSlackH, so its quota goes to queued jobs in zones that do pay back (run bac47587: the French w-05 held
+    // 32 vCPUs from t=17.6 to 115, pausing half the time for ~no gain, while the Austrian w-13 queued 33 h)
+    let yieldAt = null;
+    if (o.yieldFlat && pick && !use.forced && use.prof.family === "cpu" && fc?.length) {
+      const nRun = Math.min(fc.length, Math.max(1, Math.ceil(use.needH)));
+      const straight = fc.slice(0, nRun).reduce((a, b) => a + b, 0) / nRun;
+      const fv = straight > 0 ? 1 - use.expI / straight : 1;
+      const slack = use.hardH - use.needH;
+      if (slack > o.yieldSlackH + 0.5 && fv < o.yieldFvMax) yieldAt = tH + slack - o.yieldSlackH;
+      if (o.trace && !(view.memo?.get(`yld:${x.j.w.id}`) >= Math.floor(tH))) { view.memo?.set(`yld:${x.j.w.id}`, Math.floor(tH)); o.trace({ wl: x.j.w.id, t: +tH.toFixed(2), why: yieldAt ? "yield" : "no-yield", fv: +fv.toFixed(3), zone: use.zone.slug, slack: +slack.toFixed(1), until: yieldAt ? +yieldAt.toFixed(1) : null }); }
+    }
+    fresh.push({ j: x.j, it, pick, use, gateNow, value, list: x.list, yieldAt });
     items.push(it);
   }
   // Future releases take part in the fast-forward with their best placement at release time.
@@ -515,8 +534,10 @@ export function decide(cat, view, opts = {}) {
     const cleanJob = (d) => { const z = cat.zones.get(d.j.vms[0]?.zone); const f = z && view.fc(z.area); return !!f?.length && (f.reduce((a, b) => a + b, 0) / f.length) * z.pue < o.cleanNoPauseI; };
     const cands = [
       ...deployed.filter((d) => d.pausable && !d.gateRun && d.value > 0 && d.value * wt(d.j.w.id) >= bar(d.it.fp) && !(blocked && o.cleanNoPauseI > 0 && cleanJob(d))).map((d) => ({ kind: "pause", it: d.it, value: d.value * wt(d.j.w.id) })),
-      ...fresh.filter((x) => x.pick && !x.gateNow && x.value > 0 && x.value * wt(x.j.w.id) >= bar(x.it.fp)).map((x) => ({ kind: "defer", it: x.it, value: x.value * wt(x.j.w.id) })),
+      ...fresh.filter((x) => x.pick && !x.yieldAt && !x.gateNow && x.value > 0 && x.value * wt(x.j.w.id) >= bar(x.it.fp)).map((x) => ({ kind: "defer", it: x.it, value: x.value * wt(x.j.w.id) })),
     ].sort((a, b) => b.value - a.value);
+    // yielding jobs are checked first, with their whole wait (not one hour) in the projection
+    cands.unshift(...fresh.filter((x) => x.yieldAt).map((x) => ({ kind: "defer", it: x.it, value: Infinity, until: x.yieldAt })));
     // harmlessPauses: while jobs queue, a pause below the bar is still granted when the projection shows it moves
     // no queued job's start — the bar exists to keep quota for them, and this job's quota isn't what they wait for
     // (run 5c35cc4b: queued jobs took exactly the cores freed by w-01, w-02, w-04, w-07; w-03, w-05, w-06, w-14 and
@@ -555,7 +576,7 @@ export function decide(cat, view, opts = {}) {
       for (const c of cands) {
         if (preempted.has(c.it.id)) continue;
         const saved = { ...c.it };
-        if (c.kind === "pause") c.it.startAt = tH + q; else c.it.avail = tH + q;
+        if (c.kind === "pause") c.it.startAt = tH + q; else c.it.avail = c.until ?? tH + q;
         const r = fastForward(cat, tH, base, items);
         let ok = lateOf(r, c.it) <= -buffer, by = ok ? null : "own";
         // stall guard: a stopped (or not yet created) job must still finish stallH before its real deadline,
@@ -567,6 +588,42 @@ export function decide(cat, view, opts = {}) {
         if (!ok && o.trace && c.it.fp.fam !== "cpu") o.trace({ wl: c.it.id, t: +tH.toFixed(2), why: "projection", by, cushion, blocked, value: +c.value.toFixed(2) });
         if (ok) { (c.kind === "pause" ? paused : deferred).add(c.it.id); plan = r; }
         else Object.assign(c.it, saved);
+      }
+    }
+    // handOver: a fresh job that holds a quota slot but defers its start leaves the slot idle while others queue
+    // (run bac47587: w-01's freed 32 vCPUs sat unused ~7 h while the first in line, w-13, waited out dirty hours).
+    // The next queued job may take it when its own clean-hour rule says start now and the projection keeps every
+    // job — the deferring one included — within its cushion; the deferring job then waits for the next slot.
+    if (o.handOver && blocked) {
+      const givers = fresh.filter((x) => x.pick && deferred.has(x.j.w.id));
+      const queued = fresh.filter((x) => !x.pick && !deferred.has(x.j.w.id));
+      if (givers.length && queued.length) {
+        const used = { vms: free.vms, cores: free.cores, cards: { ...free.cards } };
+        for (const g of givers) { const f = g.it.fp; used.vms -= f.vms; used.cores -= f.cores; if (f.cards) used.cards[f.fam] = (used.cards[f.fam] ?? 0) - f.cards; }
+        const lateOf = (r, it) => (r.finish.get(it.id) ?? Infinity) - it.due;
+        const cushion = Math.max(buffer, o.queueCushionH);
+        for (const x of queued) {
+          const best = x.list[0], anyOk = x.list.some((c) => !c.doomed);
+          let pick2 = null;
+          for (const c of x.list) {
+            if (anyOk && c.doomed) continue;
+            if (!fitsQuota(cat, used, c.prof, c.k)) continue;
+            if ((c.rank ?? c.grams) <= (best.rank ?? best.grams) * (1 + o.fitTol) || best.forced || c.forced) { pick2 = c; break; }
+          }
+          if (!pick2 || pick2.forced) continue;
+          const fc2 = view.fc(pick2.zone.area), av2 = Math.min(pick2.hardH, o.cpuWindowH);
+          const go = (!cpuPause && pick2.prof.family === "cpu") || gate(fc2, pick2.needH, av2) || withinNoise(fc2, pick2.needH, av2, o.noiseBand);
+          if (!go) continue;
+          const saved = { ...x.it };
+          Object.assign(x.it, { fp: footprint(pick2.prof, pick2.k), needH: pick2.needH, due: deadlineH(x.j) - marginH(o, pick2.needH, pick2.prof.family), deployed: true, startAt: tH });
+          const r = fastForward(cat, tH, base, items);
+          let ok = true;
+          for (const it of items) if (lateOf(r, it) > Math.max(lateOf(plan, it), -cushion) + 1e-6) { ok = false; break; }
+          if (o.stallH > 0) for (const g of givers) if ((r.finish.get(g.it.id) ?? Infinity) > deadlineH(g.j) - o.stallH) { ok = false; break; }
+          if (!ok) { Object.assign(x.it, saved); continue; }
+          x.pick = pick2; x.use = pick2; x.handed = true; plan = r;
+          const f = x.it.fp; used.vms += f.vms; used.cores += f.cores; if (f.cards) used.cards[f.fam] = (used.cards[f.fam] ?? 0) + f.cards;
+        }
       }
     }
   } else if (safe && o.pauseMode === "gate") {
