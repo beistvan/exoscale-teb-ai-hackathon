@@ -54,6 +54,9 @@ export const CONTROL = {
   wakeOnData: true,      // decide as soon as a newer forecast vintage or observation arrives
   wakeDebounceMs: 30,    // ...after this short wait, so one hour's burst of replies triggers one decision
   infoDwell: true,       // inside the stop dwell, still allow a stop when new data arrived since the last toggle
+  maxExtrapMs: 10000,    // never extrapolate the simulated clock more than this past the freshest status reply
+  safeModeErrors: 8,     // after this many failed decision steps in a row, start every stopped VM of unfinished work
+  freezeMs: 5000,        // a loop gap longer than this = this process was frozen; wait for a status requested after it
   stallBufferS: 35,      // wall seconds a paused / not-yet-created job must keep before its deadline while the server shows
                          // stress (run f085e7d7: 3-5 s calls, then a 32 s start = 6.5 sim h at 720x, and a paused job missed)
   stallBaseS: 10,        // ...and always (mock: 10 s costs ~1 pt, 25 s ~11 pts, 35 s ~29 pts)
@@ -103,7 +106,7 @@ export class Controller {
       this.lat.status = ewma(this.lat.status, t1 - t0); this.latSample("status", t1 - t0);
       if (!s?.virtual_time) return;
       const vt = Date.parse(s.virtual_time);
-      const snap = { s, vt, t: (vt - this.cat.T0) / H, wallAt: (t0 + t1) / 2, speed: Number(s.speed_multiplier) || 720, state: String(s.state ?? "").toUpperCase() };
+      const snap = { s, vt, t: (vt - this.cat.T0) / H, wallAt: (t0 + t1) / 2, reqAt: t0, speed: Number(s.speed_multiplier) || 720, state: String(s.state ?? "").toUpperCase() };
       // freshest wins; READY/PAUSED replies don't advance vt, so prefer the later reply then
       if (!this.snap || snap.vt > this.snap.vt || (snap.vt === this.snap.vt && snap.wallAt >= this.snap.wallAt)) this.snap = snap;
       this.event({ k: "status", latMs: Math.round(t1 - t0), snapH: +snap.t.toFixed(3), state: snap.state, delivered: (s.workloads ?? []).filter((w) => w.final_output_delivered).length });
@@ -234,12 +237,14 @@ export class Controller {
     return rho >= this.o.nowcastMinRho ? { rho, a0: a.get(last), t0: last, n } : null;
   }
 
-  /** Simulated hours "now", extrapolated from the freshest snapshot. */
+  /** Simulated hours "now", extrapolated from the freshest snapshot — at most maxExtrapMs past it, so a local clock
+   *  jump or a long freeze can't run the estimate ahead of the server (run fc278340: the host froze 195 s, its clock
+   *  then jumped, and the unclamped estimate read t=130 while the server was at 92). */
   tNow() {
     const s = this.snap;
     if (!s) return null;
     if (s.state !== "RUNNING") return s.t;
-    return s.t + ((this.clock.now() - s.wallAt) * s.speed) / H;
+    return s.t + (Math.max(0, Math.min(this.clock.now() - s.wallAt, this.o.maxExtrapMs)) * s.speed) / H;
   }
   latSample(kind, ms) {
     const a = (this.latRecent[kind] ??= []); a.push(ms); if (a.length > 15) a.shift();
@@ -279,6 +284,7 @@ export class Controller {
     // rawTracker: rate samples use the engine's own VM states, not the acknowledged-action overlay
     const raw = this.o.rawTracker ? new Map((s.workloads ?? []).flatMap((w) => (w.assignments ?? []).map((x) => [x.vm_id, x.state]))) : null;
     const v = buildView(this.cat, status, receipt, this.tracker, raw);
+    v.tSnap = v.t; // the server's own time at this snapshot (deadline-passed deletes rely on it, not on tAct)
     v.t = tAct;
     v.memo = this.memo;
     const hourStart = this.cat.T0 + Math.floor(tAct) * H;
@@ -425,6 +431,24 @@ export class Controller {
     this.done = true;
   }
 
+  /** Start every stopped VM of an undelivered workload (used when the decision step keeps failing). */
+  safeMode() {
+    const wls = this.snap?.s?.workloads ?? [];
+    let n = 0;
+    for (const w of wls) {
+      if (w.final_output_delivered) { // delivered: delete, as the policy would (idle VMs still draw power)
+        for (const a of w.assignments ?? []) if (!this.deleted.has(a.vm_id)) this.fireVm({ type: "delete", wl: w.id, vm: { id: a.vm_id, zone: a.zone }, why: "safe mode: delivered" }, this.tNow() ?? 0);
+        continue;
+      }
+      for (const a of w.assignments ?? []) {
+        if (a.state !== "stopped" || this.deleted.has(a.vm_id)) continue;
+        this.fireVm({ type: "start", wl: w.id, vm: { id: a.vm_id, zone: a.zone }, why: "safe mode: decisions failing" }, this.tNow() ?? 0);
+        n++;
+      }
+    }
+    if (n) this.log(`[safe] ${this.stepErrors} failed steps in a row: starting ${n} stopped VM(s)`);
+  }
+
   /** VMs bound to workloads that this controller didn't create (e.g. left by the starter demo):
    *  look up their real instance type so quota, timing and gating are planned exactly. */
   adoptForeign() {
@@ -500,9 +524,22 @@ export class Controller {
 
   async runLoop() {
     while (!this.done) {
+      // a loop iteration that took far longer than planned means this process was frozen (host sleep, CPU
+      // starvation): act again only on a status reply requested after the freeze
+      const wallNow = this.clock.now();
+      if (this.lastLoopWall != null && wallNow - this.lastLoopWall > this.o.freezeMs) {
+        this.freezeAt = wallNow;
+        this.log(`[freeze] no loop for ${((wallNow - this.lastLoopWall) / 1000).toFixed(1)} s — waiting for a fresh status before acting`);
+      }
+      this.lastLoopWall = wallNow;
       this.pollStatus();
-      if (this.snap && !this.finalizing) {
-        try { await this.step(); } catch (e) { this.log(`[step] error ${e?.stack ?? e}`); }
+      if (this.snap && !this.finalizing && !(this.freezeAt != null && this.snap.reqAt < this.freezeAt)) {
+        try { await this.step(); this.stepErrors = 0; } catch (e) {
+          this.stepErrors = (this.stepErrors ?? 0) + 1;
+          this.log(`[step] error ${e?.stack ?? e}`);
+          // safe mode: decisions keep failing — never leave unfinished work stopped (it would sit out its deadline)
+          if (this.stepErrors >= this.o.safeModeErrors) this.safeMode();
+        }
       }
       if (this.done) break;
       const ms = this.o.alignBoundary ? Math.max(2, Math.min(this.o.loopMs, this.msToBoundary() + 2)) : this.o.loopMs;

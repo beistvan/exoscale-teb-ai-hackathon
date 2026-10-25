@@ -65,7 +65,8 @@ const policyOpts = jsonEnv("GREENOPS_POLICY_OPTS"), ctlOpts = jsonEnv("GREENOPS_
 async function main() {
   log(`[boot] run=${RUN} mode=${MODE}${DRY ? " (dry)" : ""} state=${STATE}`);
   if (Object.keys(policyOpts).length || Object.keys(ctlOpts).length) log(`[boot] overrides policy=${JSON.stringify(policyOpts)} control=${JSON.stringify(ctlOpts)}`);
-  await api.discover(cat, log);
+  // a receipt holding VMs of this run means we are restarting into a running run: discover fast
+  await api.discover(cat, log, { fast: !DRY && MODE === "run" && Object.keys(st.vms ?? {}).length > 0 });
   log(`[boot] discovery done: ${cat.zones.size} zones, templates for ${api.templates.size}`);
   if (DRY) {
     // one decision with no side effects

@@ -115,12 +115,24 @@ export function makeLiveApi({ key, secret, cloudEndpoint, workEndpoint, gridEndp
       const it = r.json?.["instance-type"];
       return r.ok ? { prof: typeof it === "string" ? it : it?.id ?? null, name: r.json?.name ?? "" } : null;
     },
-    /** Discovery before the clock starts: zones, live per-zone offerings, templates — all in parallel. */
-    async discover(cat, log) {
+    /** Discovery before the clock starts: zones, live per-zone offerings, templates — all in parallel.
+     *  fast (a restart into a running run, where every second costs 0.2 simulated hours): zones and ONE template
+     *  only, trusting the catalog's offerings — run 50bd072e's restart spent 130 s here at 15-34 s per call. */
+    async discover(cat, log, { fast = false } = {}) {
       const z = await cloud("", "GET", "/zone", null, null, { retries: 4 });
       const live = new Set((z.json?.zones ?? []).map((x) => x.name));
       if (!live.size) throw new Error(`zone discovery failed: ${z.status} ${String(z.text ?? "").slice(0, 200)}`);
       for (const slug of [...cat.zones.keys()]) if (!live.has(slug)) { cat.zones.delete(slug); log(`[discover] zone ${slug} not offered by this run`); }
+      if (fast) {
+        // templates are global: the first zone that answers gives the id for all
+        const tid = await Promise.any([...cat.zones.keys()].slice(0, 3).map(async (slug) => {
+          const tp = await cloud(slug, "GET", "/template", null, { visibility: "public" }, { retries: 2 });
+          const ts = tp.json?.templates ?? []; const t = ts.find((x) => /ubuntu/i.test(x.name ?? "")) ?? ts[0];
+          if (!t?.id) throw new Error("no template"); return t.id;
+        })).catch(() => null);
+        if (tid) { for (const slug of cat.zones.keys()) this.templates.set(slug, tid); log("[discover] fast path (restart): catalog offerings, one template"); return; }
+        log("[discover] fast path failed — full discovery");
+      }
       await Promise.all([...cat.zones.keys()].map(async (slug) => {
         const [it, tp] = await Promise.all([cloud(slug, "GET", "/instance-type", null, null, { retries: 4 }), cloud(slug, "GET", "/template", null, { visibility: "public" }, { retries: 4 })]);
         const offered = it.json?.["instance-types"];
