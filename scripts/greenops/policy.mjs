@@ -50,6 +50,7 @@ export const DEFAULTS = {
   // and scored 5 pts below run 6 — CPU jobs gained, GPU jobs lost — so GPUs keep the full margin
   marginCutH: 0, lowLatMarginMinH: 1,
   marginCpuOnly: true, // the cut applies to CPU jobs only; GPU jobs keep the full margin
+  gpuMarginCutH: 0,    // (experiment) a smaller low-lag cut for GPU jobs too (e.g. 2: 4 h -> 2 h); the stall guard covers server stalls
   marginFracGpu: null, // GPU jobs' runtime-proportional margin (null: marginFrac)
   prestageNoDefer: false, // with prestage: stage a job before its release even if the current hour looks dirty
   windowDist: false,   // placement: model the window beyond the forecast with this run's observed hours (see scorePlacement)
@@ -278,7 +279,7 @@ export function decide(cat, view, opts = {}) {
   const o = o0.latH <= o0.lowLatH ? { ...o0, ...o0.lowLat } : o0;
   // with a fast API the deadline margin can shrink (durations are deterministic; the controller's
   // latency term is kept): mock +10..+33 pts, 0 misses in 220 runs at a 1 h base
-  if (o0.latH <= o0.lowLatH && o.marginCutH > 0) { o.marginMinHGpu = o0.marginMinH; o.marginMinH = Math.max(o.lowLatMarginMinH, o0.marginMinH - o.marginCutH); }
+  if (o0.latH <= o0.lowLatH && o.marginCutH > 0) { o.marginMinHGpu = Math.max(o.lowLatMarginMinH, o0.marginMinH - (o.gpuMarginCutH ?? 0)); o.marginMinH = Math.max(o.lowLatMarginMinH, o0.marginMinH - o.marginCutH); }
   HP = Number(o.horizonPenalty) || 0;
   LLF = Boolean(o.llf);
   o.distFor = view.dist;
